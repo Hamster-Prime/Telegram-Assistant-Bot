@@ -17,7 +17,6 @@ from app.core.streaming import (
     TG_MESSAGE_LIMIT,
     _render_for_telegram,
     clip,
-    format_for_telegram,
 )
 
 
@@ -121,8 +120,10 @@ async def test_edit_renderer_lifecycle(limiter):
     assert bot.edits[-1] == (42, 101, "第一段完整回复")
 
 
-def test_format_for_telegram_converts_common_markdown_to_html():
-    assert format_for_telegram("**粗体** 和 `代码`") == "<b>粗体</b> 和 <code>代码</code>"
+def test_render_for_telegram_passes_through_valid_html():
+    assert _render_for_telegram("<b>粗体</b> 和 <code>代码</code>") == (
+        "<b>粗体</b> 和 <code>代码</code>"
+    )
 
 
 def test_render_for_telegram_respects_limit_after_html_escaping():
@@ -134,7 +135,7 @@ async def test_edit_renderer_sends_telegram_html(limiter):
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1,
                      typing_refresh_s=10)
     await r.start()
-    await r.finalize("**粗体**")
+    await r.finalize("<b>粗体</b>")
 
     assert bot.sent_kwargs[0].get("parse_mode") == "HTML"
     assert bot.edit_kwargs[-1].get("parse_mode") == "HTML"
@@ -162,7 +163,7 @@ async def test_draft_renderer_does_not_send_initial_placeholder_in_private(limit
     r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
 
     await r.start()
-    await r.finalize("**最终回复**")
+    await r.finalize("<b>最终回复</b>")
 
     assert bot.sent == [(42, "<b>最终回复</b>")]
     assert bot.sent_kwargs[-1].get("parse_mode") == "HTML"

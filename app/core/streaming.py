@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import re
 import secrets
 from typing import Any, Protocol
 
@@ -41,6 +40,7 @@ from aiogram.types import (
 )
 
 from app.core.concurrency import SendRateLimiter
+from app.core.htmlfmt import sanitize_telegram_html
 from app.core.ratelimit import EditThrottle
 from app.logging import get_logger
 
@@ -57,44 +57,9 @@ def clip(text: str, limit: int = TG_MESSAGE_LIMIT) -> str:
     return text[: limit - 1] + "…"
 
 
-def format_for_telegram(text: str) -> str:
-    """Convert common Markdown emitted by the model into Telegram HTML."""
-    placeholders: list[str] = []
-
-    def stash(value: str) -> str:
-        placeholders.append(value)
-        return f"\u0000TGFMT{len(placeholders) - 1}\u0000"
-
-    def fence_repl(match: re.Match[str]) -> str:
-        code = match.group(2)
-        return stash(f"<pre><code>{html.escape(code)}</code></pre>")
-
-    def inline_code_repl(match: re.Match[str]) -> str:
-        return stash(f"<code>{html.escape(match.group(1))}</code>")
-
-    def link_repl(match: re.Match[str]) -> str:
-        label = html.escape(match.group(1))
-        url = html.escape(match.group(2), quote=True)
-        return stash(f'<a href="{url}">{label}</a>')
-
-    text = re.sub(r"```([A-Za-z0-9_+\-.#]*)\n?([\s\S]*?)```", fence_repl, text)
-    text = re.sub(r"`([^`\n]+)`", inline_code_repl, text)
-    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", link_repl, text)
-
-    escaped = html.escape(text)
-    escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
-    escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<i>\1</i>", escaped)
-
-    for i, value in enumerate(placeholders):
-        escaped = escaped.replace(f"\u0000TGFMT{i}\u0000", value)
-    return escaped
-
-
 def _render_for_telegram(text: str) -> str:
     raw = clip(text)
-    rendered = format_for_telegram(raw)
+    rendered = sanitize_telegram_html(raw)
     if len(rendered) <= TG_MESSAGE_LIMIT:
         return rendered
     while raw and len(html.escape(raw)) > TG_MESSAGE_LIMIT:
