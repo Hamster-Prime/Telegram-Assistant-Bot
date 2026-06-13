@@ -86,7 +86,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "联网搜索最新信息。返回标题/链接/摘要列表;需要详细正文时再用 web_fetch 抓取具体链接",
+            "description": (
+                "联网搜索事实和最新信息。用户明确说“搜一下/查一下/帮我搜/最新/最近/新闻/动态”"
+                "或询问可能变化的现实信息时必须调用本工具。不要只承诺搜索;调用后基于结果回答。"
+                "返回标题/链接/摘要列表;需要详细正文时再用 web_fetch 抓取具体链接"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

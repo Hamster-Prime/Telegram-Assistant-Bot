@@ -26,6 +26,30 @@ async def test_context_basic_structure(daos: DAOBundle):
     assert msgs[-1] == {"role": "user", "content": "你好"}
 
 
+async def test_system_prompt_requires_search_for_fresh_factual_questions(daos: DAOBundle):
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "帮我搜一下 Kimi K2 的最新动态", query_text="Kimi K2 最新动态")
+    system = msgs[0]["content"]
+
+    assert "事实优先" in system
+    assert "不要依赖记忆回答" in system
+    assert "必须调用 web_search" in system
+    assert "最新" in system
+    assert "搜一下" in system
+    assert "不能只说" in system and "去搜索" in system
+
+
+async def test_system_prompt_limits_output_to_telegram_supported_format(daos: DAOBundle):
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "说明格式要求")
+    system = msgs[0]["content"]
+
+    assert "Telegram 支持的格式" in system
+    assert "不要使用 Markdown 标题" in system
+    assert "# 标题" in system
+    assert "不要输出井号" in system
+
+
 async def test_context_includes_memory_and_summary(daos: DAOBundle):
     await daos.memories.add("user", 1, "用户在上海工作")
     await daos.summaries.add(100, "此前讨论了天气", 5, 10)

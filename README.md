@@ -7,7 +7,8 @@
 ## 核心特性
 
 - **多 API Key fallback**:`MINIMAX_API_KEYS` 逗号分隔填写多个 key;每个 key 失败后重试 1 次,再失败自动切换下一个,全部失败才向用户报错
-- **三场景流式输出**:私聊 `sendMessageDraft` 原生草稿流;群聊/Guest `editMessageText` 模拟流(节流防限流)
+- **三场景流式输出**:私聊不发送初始占位消息,按需使用 `sendMessageDraft` 草稿流;群聊/Guest `editMessageText` 模拟流(节流防限流)
+- **图片输入**:支持 photo、图片文档、普通贴纸;动态贴纸/GIF 使用缩略图按图片传入模型,视频消息直接忽略
 - **并发不阻塞**:多用户互不阻塞;同一用户「流式回答 + 后台生成视频 + 新提问」三任务并行
 - **后台生成 Worker**:视频/音乐异步生成,回调 + 轮询双路送达,服务重启自动恢复未决任务
 - **搜索回退链**:Firecrawl → Brave → DuckDuckGo,每家重试 1 次,全败才报错
@@ -18,9 +19,8 @@
 ## 快速开始
 
 ```bash
-# 1. 创建虚拟环境并安装依赖
-python -m venv .venv
-.venv/Scripts/pip install aiogram aiohttp httpx ddgs aiosqlite pydantic-settings structlog tenacity tzdata
+# 1. 安装依赖(uv 会自动创建/更新 .venv)
+uv sync
 
 # 2. 配置环境变量
 copy .env.example .env
@@ -28,7 +28,7 @@ copy .env.example .env
 
 # 3. 启动(本地调试用 polling 模式)
 #    .env 设 MODE=polling
-.venv/Scripts/python -X utf8 -m app.main
+uv run python -X utf8 -m app.main
 ```
 
 生产部署用 webhook 模式:`MODE=webhook`,配 `WEBHOOK_HOST`(TLS 由 Caddy/Nginx 反代),Bot 监听 8080 端口。
@@ -59,7 +59,8 @@ MINIMAX_API_KEYS=key1,key2,key3
 ## 测试
 
 ```bash
-.venv/Scripts/python -X utf8 -m pytest tests/ -v
+uv sync --extra dev
+uv run python -X utf8 -m pytest tests/ -v
 ```
 
 覆盖:多 Key fallback(8 用例)、并发原语、鉴权配额、上下文压缩、搜索回退链、流式节流、Agent 工具循环、后台 Worker(幂等/恢复)、server 回调端点。

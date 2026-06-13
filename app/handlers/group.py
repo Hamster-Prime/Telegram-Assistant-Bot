@@ -33,7 +33,7 @@ def _strip_mention(text: str, bot_username: str) -> str:
 
 
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-                F.text | F.photo | F.video | F.document,
+                F.text | F.photo | F.video | F.document | F.sticker | F.animation,
                 ~F.text.startswith("/"))
 async def handle_group(message: Message, user: User, svc: Services) -> None:
     me = await svc.bot.me()
@@ -45,6 +45,8 @@ async def handle_group(message: Message, user: User, svc: Services) -> None:
              预览=(message.text or message.caption or "")[:60])
 
     content, query_text = await build_content(svc, message)
+    if content is None:
+        return
     if isinstance(content, str):
         content = _strip_mention(content, me.username or "")
         query_text = content

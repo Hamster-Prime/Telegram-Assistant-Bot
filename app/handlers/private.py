@@ -17,13 +17,15 @@ router = Router(name="private")
 
 
 @router.message(F.chat.type == "private",
-                F.text | F.photo | F.video | F.document,
+                F.text | F.photo | F.video | F.document | F.sticker | F.animation,
                 ~F.text.startswith("/"))
 async def handle_private(message: Message, user: User, svc: Services) -> None:
     log.info("私聊消息", 用户=user.tg_id, 用户名=user.username or "无",
              类型="文本" if message.text else "多媒体",
              预览=(message.text or message.caption or "")[:60])
     content, query_text = await build_content(svc, message)
+    if content is None:
+        return
     renderer = DraftRenderer(svc.bot, message.chat.id, svc.limiter,
                              throttle_ms=svc.settings.edit_throttle_ms)
     await run_chat_pipeline(svc, user, message, content, renderer,

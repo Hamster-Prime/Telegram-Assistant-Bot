@@ -8,7 +8,14 @@ import pytest
 
 from app.core.concurrency import SendRateLimiter
 from app.core.ratelimit import EditThrottle
-from app.core.streaming import EditRenderer, clip
+from app.core.streaming import (
+    DraftRenderer,
+    EditRenderer,
+    TG_MESSAGE_LIMIT,
+    _render_for_telegram,
+    clip,
+    format_for_telegram,
+)
 
 
 def test_clip():
@@ -56,16 +63,24 @@ class FakeBot:
 
     def __init__(self):
         self.sent: list[tuple] = []
+        self.sent_kwargs: list[dict] = []
         self.edits: list[tuple] = []
+        self.edit_kwargs: list[dict] = []
+        self.methods: list[object] = []
         self._next_id = 100
+
+    async def __call__(self, method):
+        self.methods.append(method)
 
     async def send_message(self, chat_id, text, **kwargs):
         self._next_id += 1
         self.sent.append((chat_id, text))
+        self.sent_kwargs.append(kwargs)
         return FakeMessage(self._next_id)
 
     async def edit_message_text(self, text, chat_id=None, message_id=None, **kwargs):
         self.edits.append((chat_id, message_id, text))
+        self.edit_kwargs.append(kwargs)
 
 
 @pytest.fixture
@@ -88,6 +103,25 @@ async def test_edit_renderer_lifecycle(limiter):
     assert bot.edits[-1] == (42, 101, "第一段完整回复")
 
 
+def test_format_for_telegram_converts_common_markdown_to_html():
+    assert format_for_telegram("**粗体** 和 `代码`") == "<b>粗体</b> 和 <code>代码</code>"
+
+
+def test_render_for_telegram_respects_limit_after_html_escaping():
+    assert len(_render_for_telegram("&" * 5000)) <= TG_MESSAGE_LIMIT
+
+
+async def test_edit_renderer_sends_telegram_html(limiter):
+    bot = FakeBot()
+    r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1)
+    await r.start()
+    await r.finalize("**粗体**")
+
+    assert bot.sent_kwargs[0].get("parse_mode") == "HTML"
+    assert bot.edit_kwargs[-1].get("parse_mode") == "HTML"
+    assert bot.edits[-1][2] == "<b>粗体</b>"
+
+
 async def test_edit_renderer_fail_path(limiter):
     bot = FakeBot()
     r = EditRenderer(bot, chat_id=42, limiter=limiter)
@@ -102,3 +136,15 @@ async def test_edit_renderer_empty_final(limiter):
     await r.start()
     await r.finalize("")
     assert bot.edits[-1][2] == "(空回复)"
+
+
+async def test_draft_renderer_does_not_send_initial_placeholder_in_private(limiter):
+    bot = FakeBot()
+    r = DraftRenderer(bot, chat_id=42, limiter=limiter)
+
+    await r.start()
+    await r.finalize("**最终回复**")
+
+    assert bot.methods == []
+    assert bot.sent == [(42, "<b>最终回复</b>")]
+    assert bot.sent_kwargs[-1].get("parse_mode") == "HTML"

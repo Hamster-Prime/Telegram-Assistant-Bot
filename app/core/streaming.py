@@ -10,6 +10,8 @@ aiogram 3.28 已原生封装 SendMessageDraft / AnswerGuestQuery(Bot API 10.x),
 """
 from __future__ import annotations
 
+import html
+import re
 import secrets
 from typing import Protocol
 
@@ -25,12 +27,58 @@ from app.logging import get_logger
 log = get_logger("core.streaming")
 
 TG_MESSAGE_LIMIT = 4096  # Telegram 单消息长度上限
+TG_PARSE_MODE = "HTML"
 
 
 def clip(text: str, limit: int = TG_MESSAGE_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def format_for_telegram(text: str) -> str:
+    """Convert common Markdown emitted by the model into Telegram HTML."""
+    placeholders: list[str] = []
+
+    def stash(value: str) -> str:
+        placeholders.append(value)
+        return f"\u0000TGFMT{len(placeholders) - 1}\u0000"
+
+    def fence_repl(match: re.Match[str]) -> str:
+        code = match.group(2)
+        return stash(f"<pre><code>{html.escape(code)}</code></pre>")
+
+    def inline_code_repl(match: re.Match[str]) -> str:
+        return stash(f"<code>{html.escape(match.group(1))}</code>")
+
+    def link_repl(match: re.Match[str]) -> str:
+        label = html.escape(match.group(1))
+        url = html.escape(match.group(2), quote=True)
+        return stash(f'<a href="{url}">{label}</a>')
+
+    text = re.sub(r"```([A-Za-z0-9_+\-.#]*)\n?([\s\S]*?)```", fence_repl, text)
+    text = re.sub(r"`([^`\n]+)`", inline_code_repl, text)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", link_repl, text)
+
+    escaped = html.escape(text)
+    escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<i>\1</i>", escaped)
+
+    for i, value in enumerate(placeholders):
+        escaped = escaped.replace(f"\u0000TGFMT{i}\u0000", value)
+    return escaped
+
+
+def _render_for_telegram(text: str) -> str:
+    raw = clip(text)
+    rendered = format_for_telegram(raw)
+    if len(rendered) <= TG_MESSAGE_LIMIT:
+        return rendered
+    while raw and len(html.escape(raw)) > TG_MESSAGE_LIMIT:
+        raw = raw[:-1]
+    return html.escape(raw)
 
 
 async def _sleep_retry_after(e: TelegramRetryAfter) -> None:
@@ -71,21 +119,12 @@ class DraftRenderer:
         await self._bot(SendMessageDraft(
             chat_id=self._chat_id,
             draft_id=self._draft_id,
-            text=clip(text) or "…",
+            text=_render_for_telegram(text) or "…",
+            parse_mode=TG_PARSE_MODE,
         ))
 
     async def start(self) -> None:
-        try:
-            await self._limiter.acquire()
-            await self._send_draft("…")
-            log.debug("私聊草稿流已开始", 会话=self._chat_id, 草稿ID=self._draft_id)
-        except Exception as e:
-            # Bot API 版本不支持草稿 → 退化为占位+编辑流
-            log.warning("sendMessageDraft不可用,退化为编辑流", 会话=self._chat_id,
-                        原因=str(e)[:120])
-            self._draft_supported = False
-            self._fallback = EditRenderer(self._bot, self._chat_id, self._limiter)
-            await self._fallback.start()
+        log.debug("私聊不发送初始占位消息", 会话=self._chat_id, 草稿ID=self._draft_id)
 
     async def update(self, full_text: str) -> None:
         if not self._draft_supported:
@@ -112,7 +151,10 @@ class DraftRenderer:
         while True:
             try:
                 await self._limiter.acquire()
-                msg = await self._bot.send_message(self._chat_id, text)
+                msg = await self._bot.send_message(
+                    self._chat_id, _render_for_telegram(text),
+                    parse_mode=TG_PARSE_MODE,
+                )
                 log.info("私聊回复已定稿", 会话=self._chat_id, 消息ID=msg.message_id,
                          长度=len(text))
                 return msg.message_id
@@ -122,7 +164,10 @@ class DraftRenderer:
     async def fail(self, error_text: str) -> None:
         try:
             await self._limiter.acquire()
-            await self._bot.send_message(self._chat_id, clip(error_text))
+            await self._bot.send_message(
+                self._chat_id, _render_for_telegram(error_text),
+                parse_mode=TG_PARSE_MODE,
+            )
         except Exception as e:
             log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
 
@@ -147,8 +192,9 @@ class EditRenderer:
             try:
                 await self._limiter.acquire()
                 msg = await self._bot.send_message(
-                    self._chat_id, self._placeholder,
+                    self._chat_id, _render_for_telegram(self._placeholder),
                     reply_to_message_id=self._reply_to,
+                    parse_mode=TG_PARSE_MODE,
                 )
                 self._message_id = msg.message_id
                 log.debug("占位消息已发送", 会话=self._chat_id, 消息ID=msg.message_id)
@@ -162,7 +208,9 @@ class EditRenderer:
             try:
                 await self._limiter.acquire()
                 await self._bot.edit_message_text(
-                    clip(text), chat_id=self._chat_id, message_id=self._message_id,
+                    _render_for_telegram(text), chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    parse_mode=TG_PARSE_MODE,
                 )
                 return
             except TelegramRetryAfter as e:
@@ -198,7 +246,10 @@ class EditRenderer:
                 await self._edit(error_text)
             else:
                 await self._limiter.acquire()
-                await self._bot.send_message(self._chat_id, clip(error_text))
+                await self._bot.send_message(
+                    self._chat_id, _render_for_telegram(error_text),
+                    parse_mode=TG_PARSE_MODE,
+                )
         except Exception as e:
             log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
 
@@ -229,7 +280,10 @@ class GuestRenderer:
                 result=InlineQueryResultArticle(
                     id=self._guest_query_id[:60] or "answer",
                     title="回复",
-                    input_message_content=InputTextMessageContent(message_text="▌"),
+                    input_message_content=InputTextMessageContent(
+                        message_text=_render_for_telegram("▌"),
+                        parse_mode=TG_PARSE_MODE,
+                    ),
                 ),
             ))
             self._inline_message_id = getattr(sent, "inline_message_id", None)
@@ -248,7 +302,9 @@ class GuestRenderer:
             try:
                 await self._limiter.acquire()
                 await self._bot.edit_message_text(
-                    clip(text), inline_message_id=self._inline_message_id,
+                    _render_for_telegram(text),
+                    inline_message_id=self._inline_message_id,
+                    parse_mode=TG_PARSE_MODE,
                 )
                 return
             except TelegramRetryAfter as e:
