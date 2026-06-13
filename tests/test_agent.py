@@ -1,8 +1,6 @@
 """Agent 主循环测试 —— 工具调用回灌、流式事件、错误兜底。"""
 from __future__ import annotations
 
-import pytest
-
 from app.core.agent import Agent
 from app.core.tools import ToolDispatcher
 from app.minimax.chat import ChatStreamEvent, ToolCallDelta
