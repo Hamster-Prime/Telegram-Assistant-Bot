@@ -65,8 +65,10 @@ class Agent:
                         full_text += ev.text
                         display = full_text
                         if show_thinking and reasoning_text:
-                            quoted = "\n".join(f"> {ln}" for ln in reasoning_text.splitlines())
-                            display = f"{quoted}\n\n{full_text}"
+                            display = (
+                                f"<blockquote expandable>\n{reasoning_text}"
+                                f"\n</blockquote>\n\n{full_text}"
+                            )
                         await renderer.update(display)
                     elif ev.kind == "reasoning":
                         reasoning_text += ev.text
@@ -132,8 +134,10 @@ class Agent:
             result.text = full_text
             display = full_text
             if show_thinking and result.reasoning:
-                quoted = "\n".join(f"> {ln}" for ln in result.reasoning.splitlines())
-                display = f"{quoted}\n\n{full_text}"
+                display = (
+                    f"<blockquote expandable>\n{result.reasoning}"
+                    f"\n</blockquote>\n\n{full_text}"
+                )
             await renderer.finalize(display or "(空回复)")
             # 终稿对账:末次编辑可能因限流/HTML错误未落地,消息停在较短中间状态。
             # 若 renderer 记录的最后渲染文本与最终文本不一致,强制再定稿一次。

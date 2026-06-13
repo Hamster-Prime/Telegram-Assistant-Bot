@@ -160,7 +160,7 @@ async def test_reasoning_hidden_by_default():
     assert result.reasoning == "我想想…"
 
 
-async def test_show_thinking_renders_quote():
+async def test_show_thinking_renders_expandable_blockquote():
     chat = ScriptedChat([[
         ChatStreamEvent(kind="reasoning", text="思考中"),
         ChatStreamEvent(kind="content", text="答案"),
@@ -170,7 +170,8 @@ async def test_show_thinking_renders_quote():
     r = FakeRenderer()
     await agent.run([{"role": "user", "content": "x"}], r, ToolDispatcher(),
                     show_thinking=True)
-    assert r.final.startswith("> 思考中")
+    assert r.final.startswith("<blockquote expandable>")
+    assert "思考中" in r.final
     assert "答案" in r.final
 
 
