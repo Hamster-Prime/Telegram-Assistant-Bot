@@ -83,17 +83,21 @@ class _Sanitizer(HTMLParser):
         # b strong i em u ins s strike del tg-spoiler pre
         return f"<{tag}>"
 
+    def _accept(self, tag: str, attrs: list[tuple[str, str | None]]) -> str | None:
+        """Pre-flight checks; returns rendered start tag to emit, or None to strip."""
+        if tag not in _ALLOWED_TAGS:
+            return None
+        if self._code_depth and tag in _BLOCK_TAGS:
+            return None
+        if tag == "a" and "a" in self._stack:
+            return None
+        return self._render_start(tag, attrs)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
-        if tag not in _ALLOWED_TAGS:
-            return  # 剥离:不输出,不入栈(保留内部文本)
-        if self._code_depth and tag in _BLOCK_TAGS:
-            return  # code 上下文内禁止块级标签
-        if tag == "a" and "a" in self._stack:
-            return  # 禁止 a 嵌套 a
-        rendered = self._render_start(tag, attrs)
+        rendered = self._accept(tag, attrs)
         if rendered is None:
-            return  # 属性校验失败,按剥离处理
+            return
         self._out.append(rendered)
         self._stack.append(tag)
         if tag in _CODE_TAGS:
@@ -102,13 +106,7 @@ class _Sanitizer(HTMLParser):
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         # 自闭合形式(如 <tg-spoiler/>):作为立即开闭处理
         tag = tag.lower()
-        if tag not in _ALLOWED_TAGS:
-            return
-        if self._code_depth and tag in _BLOCK_TAGS:
-            return
-        if tag == "a" and "a" in self._stack:
-            return
-        rendered = self._render_start(tag, attrs)
+        rendered = self._accept(tag, attrs)
         if rendered is None:
             return
         self._out.append(rendered)

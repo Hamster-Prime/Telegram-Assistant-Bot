@@ -1,7 +1,9 @@
 """htmlfmt —— Telegram HTML sanitizer 单元测试。"""
 from __future__ import annotations
 
-from app.core.htmlfmt import sanitize_telegram_html
+import html
+
+from app.core.htmlfmt import _Sanitizer, sanitize_telegram_html
 
 
 def test_plain_text_passthrough():
@@ -124,8 +126,46 @@ def test_block_inside_code_stripped():
     assert out == "<code>x</code>"
 
 
-def test_malformed_falls_back_to_escape():
-    # 极端垃圾输入不抛错,返回转义文本
+def test_malformed_input_escapes_safely():
+    # html.parser is lenient on garbage; result must still be safe (all < > escaped)
     out = sanitize_telegram_html("<<<<<>>>")
-    assert "<" not in out or "&lt;" in out
-    assert ">" not in out or "&gt;" in out
+    assert out == "&lt;&lt;&lt;&lt;&lt;&gt;&gt;&gt;"
+
+
+def test_parser_exception_falls_back_to_full_escape(monkeypatch):
+    def _boom(self, data):
+        raise RuntimeError("simulated parser failure")
+    monkeypatch.setattr(_Sanitizer, "feed", _boom)
+    text = "a < b & c"
+    assert sanitize_telegram_html(text) == html.escape(text)
+
+
+def test_self_closing_tag_passthrough():
+    assert sanitize_telegram_html("<b/>") == "<b></b>"
+
+
+def test_self_closing_unknown_stripped():
+    assert sanitize_telegram_html("<img/>") == ""
+
+
+def test_self_closing_anchor_with_href():
+    assert sanitize_telegram_html('<a href="https://x.com"/>') == '<a href="https://x.com"></a>'
+
+
+def test_pop_until_match_closes_inner_first():
+    # <i> opened inside <b> but never closed before </b>
+    out = sanitize_telegram_html("<b><i>x</b>")
+    assert out == "<b><i>x</i></b>"
+
+
+def test_anchor_mailto_stripped():
+    assert sanitize_telegram_html('<a href="mailto:a@b.com">邮</a>') == "邮"
+
+
+def test_anchor_tel_stripped():
+    assert sanitize_telegram_html('<a href="tel:+123">电</a>') == "电"
+
+
+def test_blockquote_expandable_strips_extra_attrs():
+    out = sanitize_telegram_html('<blockquote expandable id="x">内容</blockquote>')
+    assert out == "<blockquote expandable>内容</blockquote>"
