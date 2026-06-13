@@ -605,7 +605,10 @@ class GuestRenderer(_TickLoopMixin):
             caption = _render_for_telegram(text)
             note = pm.get("note") or ""
             if note:
-                caption = (caption + "\n" + note)[:TG_MESSAGE_LIMIT]
+                # note 来自 GuestDelivery 的原始 caption,需清洗;裁剪后可能切断
+                # 闭合标签,重新 sanitize 以自动补全(幂等于已清洗的 caption 部分)
+                caption = sanitize_telegram_html(
+                    (caption + "\n" + note)[:TG_MESSAGE_LIMIT])
             kind, url = pm["kind"], pm["url"]
             media = self._build_media(kind, url, caption)
             ok_final = await self._edit_media(media)
