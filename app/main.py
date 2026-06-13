@@ -10,7 +10,7 @@ from aiohttp import web
 
 from app.config import get_settings
 from app.core.auth import AuthMiddleware
-from app.handlers import commands, errors, group, guest, inline, private
+from app.handlers import callbacks, commands, errors, group, guest, inline, private
 from app.logging import get_logger, setup_logging
 from app.server import build_app
 from app.services import Services
@@ -32,9 +32,10 @@ def build_dispatcher(svc: Services) -> Dispatcher:
     dp.guest_message.middleware(auth)
     dp.inline_query.middleware(auth)
 
-    # 路由顺序:错误兜底 → 命令 → 三场景 → inline
+    # 路由顺序:错误兜底 → 命令 → 回调(列表翻页/导航/关闭) → 三场景 → inline
     dp.include_router(errors.router)
     dp.include_router(commands.router)
+    dp.include_router(callbacks.router)
     dp.include_router(private.router)
     dp.include_router(group.router)
     dp.include_router(guest.router)

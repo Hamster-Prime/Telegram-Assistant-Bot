@@ -1,6 +1,6 @@
 """Bot 命令菜单注册 —— setMyCommands 分级 scope(默认中文标注)。
 
-单一数据源:命令→中文描述在本文件集中定义,commands.py 的 HELP_TEXT 复用之。
+单一数据源:命令→中文描述在本文件集中定义,build_help_html() 复用之。
 分级 scope:
   - 默认(BotCommandScopeDefault):所有用户看到的用户命令
   - AllChatAdministrators:群管理员在群里追加看到 admin 命令
@@ -67,7 +67,7 @@ SUPERADMIN_COMMANDS: list[CmdSpec] = [
     CmdSpec("promote", "提升为管理员"),
     CmdSpec("demote", "降级管理员"),
     CmdSpec("broadcast", "群发广播"),
-    CmdSpec("audit", "审计日志"),
+    CmdSpec("audit", "审计日志(页码)"),
 ]
 
 
@@ -75,17 +75,27 @@ def _to_bot_commands(specs: list[CmdSpec]) -> list[BotCommand]:
     return [BotCommand(command=s.command, description=s.description) for s in specs]
 
 
-def build_help_text() -> str:
-    """供 /help 命令展示的多行文本(单一数据源,避免与菜单漂移)。"""
-    lines: list[str] = ["🤖 助理机器人", ""]
-    lines.append("【基础】" + " · ".join(f"/{s.command}" for s in USER_COMMANDS[:4]))
-    lines.append("【生成】" + " · ".join(f"/{s.command}" for s in USER_COMMANDS[8:12]))
-    lines.append("【联网】/search · /fetch")
-    lines.append("【记忆】/remember · /memories · /forget")
-    lines.append("【账户】/whoami · /quota")
-    lines.append("管理员:" + " · ".join(f"/{s.command}" for s in ADMIN_COMMANDS))
-    lines.append("超管:" + " · ".join(f"/{s.command}" for s in SUPERADMIN_COMMANDS))
-    return "\n".join(lines)
+def build_help_html() -> str:
+    """供 /help 与导航键盘展示的 HTML(单一数据源,避免与菜单漂移)。
+
+    按类别分组,每条命令带中文描述;命令用 <code> 包裹,类别标题加粗。
+    """
+    def _group(title: str, specs: list[CmdSpec]) -> str:
+        items = "\n".join(f"  /{s.command} · {s.description}" for s in specs)
+        return f"<b>{title}</b>\n{items}"
+
+    parts = [
+        "<b>🤖 助理机器人</b>",
+        "直接发消息即可聊天,支持对话 / 绘图 / 视频 / 语音 / 联网搜索 / 持久记忆。",
+        _group("基础", USER_COMMANDS[:2]),
+        _group("会话与账户", USER_COMMANDS[2:5]),
+        _group("持久记忆", USER_COMMANDS[5:8]),
+        _group("生成", USER_COMMANDS[8:12]),
+        _group("联网", USER_COMMANDS[12:14]),
+        _group("管理员", ADMIN_COMMANDS),
+        _group("超管", SUPERADMIN_COMMANDS),
+    ]
+    return "\n\n".join(parts)
 
 
 async def register_commands(

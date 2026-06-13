@@ -130,6 +130,10 @@ class QuotaDAO:
         )
         return [Quota(**dict(r)) for r in rows]
 
+    async def count_all(self) -> int:
+        row = await self.db.fetch_one("SELECT COUNT(*) AS c FROM quotas")
+        return row["c"] if row else 0
+
 
 class UsageDAO:
     def __init__(self, db: Database) -> None:
@@ -263,12 +267,21 @@ class MemoryDAO:
         )
         return [Memory(**dict(r)) for r in rows]
 
-    async def list_all(self, scope: str, owner_id: int, limit: int = 50) -> list[Memory]:
+    async def list_all(self, scope: str, owner_id: int, limit: int = 50,
+                       offset: int = 0) -> list[Memory]:
         rows = await self.db.fetch_all(
-            "SELECT * FROM memories WHERE scope=? AND owner_id=? ORDER BY id DESC LIMIT ?",
-            (scope, owner_id, limit),
+            "SELECT * FROM memories WHERE scope=? AND owner_id=? "
+            "ORDER BY id DESC LIMIT ? OFFSET ?",
+            (scope, owner_id, limit, offset),
         )
         return [Memory(**dict(r)) for r in rows]
+
+    async def count(self, scope: str, owner_id: int) -> int:
+        row = await self.db.fetch_one(
+            "SELECT COUNT(*) AS c FROM memories WHERE scope=? AND owner_id=?",
+            (scope, owner_id),
+        )
+        return row["c"] if row else 0
 
     async def delete(self, mem_id: int, scope: str, owner_id: int) -> bool:
         row = await self.db.fetch_one(
@@ -352,11 +365,15 @@ class AuditDAO:
         )
         log.info("审计日志", 操作人=actor_id, 动作=action, 对象=target_id, 详情=detail)
 
-    async def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+    async def recent(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         rows = await self.db.fetch_all(
-            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
         )
         return [dict(r) for r in rows]
+
+    async def count(self) -> int:
+        row = await self.db.fetch_one("SELECT COUNT(*) AS c FROM audit_log")
+        return row["c"] if row else 0
 
 
 class DAOBundle:
