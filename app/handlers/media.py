@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from aiogram.types import Message, PhotoSize
+from aiogram.types import ExternalReplyInfo, Message, PhotoSize
 
 from app.logging import get_logger
 from app.services import Services
@@ -43,23 +43,32 @@ def _thumbnail_mime(thumbnail: PhotoSize) -> str:
     return guess_mime(thumbnail.file_id, "image/jpeg")
 
 
-async def build_content(svc: Services, message: Message) -> tuple[Any | None, str]:
+async def build_content(
+    svc: Services,
+    message: Message | ExternalReplyInfo,
+) -> tuple[Any | None, str]:
     """把 Telegram 消息转为 M3 content(字符串或多模态块列表)。
 
     返回 (content, 纯文本提要 query_text)。content 为 None 表示该消息应被忽略。
     """
-    text = message.text or message.caption or ""
+    raw_text = getattr(message, "text", None)
+    raw_caption = getattr(message, "caption", None)
+    text = raw_text or raw_caption or ""
+    chat_id = getattr(getattr(message, "chat", None), "id", 0)
+    photo = getattr(message, "photo", None)
+    video = getattr(message, "video", None)
+    document = getattr(message, "document", None)
+    sticker = getattr(message, "sticker", None)
+    animation = getattr(message, "animation", None)
 
     # 纯文本
-    if message.text and not (
-        message.photo or message.video or message.document or message.sticker
-        or message.animation
+    if raw_text and not (
+        photo or video or document or sticker or animation
     ):
         return text, text
 
     # Telegram video 按需求直接忽略,不下载也不传给模型。
-    if message.video and not (message.photo or message.document or message.sticker
-                              or message.animation or text):
+    if video and not (photo or document or sticker or animation or text):
         return None, ""
 
     blocks: list[dict[str, Any]] = []
@@ -68,44 +77,42 @@ async def build_content(svc: Services, message: Message) -> tuple[Any | None, st
 
     try:
         # 图片
-        if message.photo:
-            photo = message.photo[-1]  # 最大尺寸
+        if photo:
+            photo_size = photo[-1]  # 最大尺寸
             await _append_image(
-                svc, blocks, photo.file_id, "image/jpeg", message.chat.id,
-                file_size=photo.file_size, label="图片",
+                svc, blocks, photo_size.file_id, "image/jpeg", chat_id,
+                file_size=photo_size.file_size, label="图片",
             )
 
         # 贴纸:普通贴纸按图片处理;动态贴纸/GIF 贴纸使用缩略图。
-        if message.sticker:
-            sticker = message.sticker
+        if sticker:
             if sticker.is_animated or sticker.is_video:
                 if sticker.thumbnail is None:
                     raise ValueError("动态贴纸缺少缩略图")
                 await _append_image(
                     svc, blocks, sticker.thumbnail.file_id,
-                    _thumbnail_mime(sticker.thumbnail), message.chat.id,
+                    _thumbnail_mime(sticker.thumbnail), chat_id,
                     file_size=sticker.thumbnail.file_size, label="贴纸缩略图",
                 )
             else:
                 await _append_image(
-                    svc, blocks, sticker.file_id, "image/webp", message.chat.id,
+                    svc, blocks, sticker.file_id, "image/webp", chat_id,
                     file_size=sticker.file_size, label="贴纸",
                 )
 
         # GIF/动画消息:使用缩略图作为图片传给模型。
-        if message.animation:
-            animation = message.animation
+        if animation:
             if animation.thumbnail is None:
                 raise ValueError("GIF 缺少缩略图")
             await _append_image(
                 svc, blocks, animation.thumbnail.file_id,
-                _thumbnail_mime(animation.thumbnail), message.chat.id,
+                _thumbnail_mime(animation.thumbnail), chat_id,
                 file_size=animation.thumbnail.file_size, label="GIF缩略图",
             )
 
         # 文档
-        if message.document:
-            doc = message.document
+        if document:
+            doc = document
             name = doc.file_name or "file"
             ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
             data, path = await download_file(svc.bot, doc.file_id)
@@ -116,14 +123,14 @@ async def build_content(svc: Services, message: Message) -> tuple[Any | None, st
                 file_id = await svc.files_api.upload(data, name)
                 blocks.append({"type": "text",
                                "text": f"(用户上传了文档 {name},文件引用 mm_file://{file_id})"})
-                log.info("入站文档已转存FilesAPI", 会话=message.chat.id,
+                log.info("入站文档已转存FilesAPI", 会话=chat_id,
                          文件名=name, 文件ID=file_id)
             else:
                 blocks.append({"type": "text",
                                "text": f"(用户上传了暂不支持解析的文件:{name})"})
     except ValueError as e:
         blocks.append({"type": "text", "text": f"(媒体处理失败:{e})"})
-        log.warning("入站媒体处理失败", 会话=message.chat.id, 原因=str(e))
+        log.warning("入站媒体处理失败", 会话=chat_id, 原因=str(e))
 
     if not blocks:
         return text or "(空消息)", text

@@ -52,10 +52,12 @@ def _with_reply_context(
     reply_text: str,
 ) -> Any:
     blocks: list[dict[str, Any]] = []
+    text_parts: list[str] = []
     if reply_text:
-        blocks.append({"type": "text", "text": f"[引用的消息]\n{reply_text}"})
-    elif reply_content is not None:
-        blocks.append({"type": "text", "text": "[引用的消息]"})
+        text_parts.append(f"[引用的消息]\n{reply_text}")
+
+    text_parts.append(f"[召唤者的问题]\n{question_text}")
+    blocks.append({"type": "text", "text": "\n\n".join(text_parts)})
 
     if reply_content is not None:
         for block in _as_blocks(reply_content):
@@ -63,12 +65,22 @@ def _with_reply_context(
                 continue
             blocks.append(block)
 
-    blocks.append({"type": "text", "text": f"[召唤者的问题]\n{question_text}"})
     blocks.extend(block for block in _as_blocks(content) if block.get("type") != "text")
 
     if len(blocks) == 1 and blocks[0].get("type") == "text":
         return blocks[0]["text"]
     return blocks
+
+
+def _reply_source(message: Message) -> Any | None:
+    return message.reply_to_message or getattr(message, "external_reply", None)
+
+
+def _reply_quote_text(message: Message, reply: Any) -> str:
+    if reply is message.reply_to_message:
+        return ""
+    quote = getattr(message, "quote", None)
+    return getattr(quote, "text", "") or ""
 
 
 async def process_guest_message(message: Message, user: User, svc: Services) -> None:
@@ -94,10 +106,12 @@ async def process_guest_message(message: Message, user: User, svc: Services) -> 
         query_text = strip_bot_mention(query_text, me.username or "")
 
     # Guest 无历史:附引用消息作为唯一上下文。只清理当前召唤消息,不改引用原文。
-    reply = message.reply_to_message
+    reply = _reply_source(message)
     if reply:
         reply_content, _reply_query = await build_content(svc, reply)
         reply_text = _content_text(reply_content) if reply_content is not None else ""
+        if not reply_text:
+            reply_text = _reply_quote_text(message, reply)
         if reply_content is not None or reply_text:
             content = _with_reply_context(content, query_text, reply_content, reply_text)
             if reply_text:

@@ -50,9 +50,12 @@ def make_guest_message(
     caption: str | None = None,
     photo: list[dict] | None = None,
     video: dict | None = None,
+    quote_text: str | None = None,
     reply_text: str | None = None,
     reply_caption: str | None = None,
     reply_photo: list[dict] | None = None,
+    external_reply: dict | None = None,
+    external_reply_photo: list[dict] | None = None,
 ) -> Message:
     payload = {
         "message_id": 2,
@@ -74,6 +77,8 @@ def make_guest_message(
         payload["photo"] = photo
     if video is not None:
         payload["video"] = video
+    if quote_text is not None:
+        payload["quote"] = {"text": quote_text, "position": 0}
     if reply_text is not None or reply_caption is not None or reply_photo is not None:
         reply_payload = {
             "message_id": 1,
@@ -88,6 +93,21 @@ def make_guest_message(
         if reply_photo is not None:
             reply_payload["photo"] = reply_photo
         payload["reply_to_message"] = reply_payload
+    if external_reply is not None or external_reply_photo is not None:
+        payload["external_reply"] = external_reply or {
+            "origin": {
+                "type": "user",
+                "date": 0,
+                "sender_user": {
+                    "id": 9,
+                    "is_bot": False,
+                    "first_name": "R",
+                },
+            },
+            "chat": {"id": 200, "type": "group"},
+            "message_id": 1,
+            "photo": external_reply_photo,
+        }
     return Message.model_validate(payload)
 
 
@@ -328,3 +348,262 @@ async def test_guest_preserves_replied_photo_caption_and_includes_photo(monkeypa
     assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
     assert captured["query_text"].startswith("[引用的消息]\n@my_bot 原图说明不要删")
     assert svc.bot.downloaded_file_ids == ["reply-photo-2"]
+
+
+async def test_guest_includes_photo_from_external_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+        captured["query_text"] = kwargs["query_text"]
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-photo": ("photos/external.jpg", b"reply-jpg", 9)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        external_reply_photo=[{
+            "file_id": "external-photo",
+            "file_unique_id": "epu1",
+            "width": 64,
+            "height": 64,
+            "file_size": 9,
+        }],
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert captured["content"][0]["text"] == "[召唤者的问题]\n描述一下"
+    assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
+    assert captured["query_text"] == "[召唤者的问题]\n描述一下"
+    assert svc.bot.downloaded_file_ids == ["external-photo"]
+
+
+async def test_guest_preserves_quote_text_from_external_photo_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+        captured["query_text"] = kwargs["query_text"]
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-photo-caption": ("photos/external.jpg", b"reply-jpg", 9)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        quote_text="@my_bot 原图说明不要删",
+        external_reply_photo=[{
+            "file_id": "external-photo-caption",
+            "file_unique_id": "epcu1",
+            "width": 64,
+            "height": 64,
+            "file_size": 9,
+        }],
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert captured["content"][0]["text"].startswith(
+        "[引用的消息]\n@my_bot 原图说明不要删"
+    )
+    assert "[召唤者的问题]\n描述一下" in captured["content"][0]["text"]
+    assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
+    assert captured["query_text"].startswith("[引用的消息]\n@my_bot 原图说明不要删")
+    assert svc.bot.downloaded_file_ids == ["external-photo-caption"]
+
+
+async def test_guest_includes_static_sticker_from_external_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+        captured["query_text"] = kwargs["query_text"]
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-sticker": ("stickers/s1.webp", b"webp-bytes", 10)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        external_reply={
+            "origin": {
+                "type": "user",
+                "date": 0,
+                "sender_user": {"id": 9, "is_bot": False, "first_name": "R"},
+            },
+            "sticker": {
+                "file_id": "external-sticker",
+                "file_unique_id": "esu1",
+                "type": "regular",
+                "width": 512,
+                "height": 512,
+                "is_animated": False,
+                "is_video": False,
+                "file_size": 10,
+            },
+        },
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert captured["content"][0]["text"] == "[召唤者的问题]\n描述一下"
+    assert image_urls(captured["content"])[0].startswith("data:image/webp;base64,")
+    assert captured["query_text"] == "[召唤者的问题]\n描述一下"
+    assert svc.bot.downloaded_file_ids == ["external-sticker"]
+
+
+async def test_guest_includes_animated_sticker_thumbnail_from_external_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-thumb": ("stickers/thumb.jpg", b"thumb-bytes", 11)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        external_reply={
+            "origin": {
+                "type": "user",
+                "date": 0,
+                "sender_user": {"id": 9, "is_bot": False, "first_name": "R"},
+            },
+            "sticker": {
+                "file_id": "animated-sticker",
+                "file_unique_id": "asu1",
+                "type": "regular",
+                "width": 512,
+                "height": 512,
+                "is_animated": True,
+                "is_video": False,
+                "thumbnail": {
+                    "file_id": "external-thumb",
+                    "file_unique_id": "etu1",
+                    "width": 128,
+                    "height": 128,
+                    "file_size": 11,
+                },
+                "file_size": 100,
+            },
+        },
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
+    assert svc.bot.downloaded_file_ids == ["external-thumb"]
+
+
+async def test_guest_includes_gif_thumbnail_from_external_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-gif-thumb": ("animations/thumb.jpg", b"thumb-bytes", 11)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        external_reply={
+            "origin": {
+                "type": "user",
+                "date": 0,
+                "sender_user": {"id": 9, "is_bot": False, "first_name": "R"},
+            },
+            "animation": {
+                "file_id": "gif-1",
+                "file_unique_id": "gu1",
+                "width": 320,
+                "height": 240,
+                "duration": 1,
+                "file_name": "clip.gif",
+                "mime_type": "image/gif",
+                "thumbnail": {
+                    "file_id": "external-gif-thumb",
+                    "file_unique_id": "egtu1",
+                    "width": 128,
+                    "height": 96,
+                    "file_size": 11,
+                },
+                "file_size": 200,
+            },
+        },
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
+    assert svc.bot.downloaded_file_ids == ["external-gif-thumb"]
+
+
+async def test_guest_ignores_video_from_external_reply(monkeypatch):
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["content"] = content
+        captured["query_text"] = kwargs["query_text"]
+
+    class FakeGuestRenderer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc({"external-video": ("videos/v1.mp4", b"video-bytes", 9)})
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message(
+        "@my_bot 描述一下",
+        external_reply={
+            "origin": {
+                "type": "user",
+                "date": 0,
+                "sender_user": {"id": 9, "is_bot": False, "first_name": "R"},
+            },
+            "video": {
+                "file_id": "external-video",
+                "file_unique_id": "evu1",
+                "width": 64,
+                "height": 64,
+                "duration": 1,
+                "file_size": 9,
+            },
+        },
+    )
+
+    await guest.process_guest_message(message, user, svc)
+
+    assert captured["content"] == "描述一下"
+    assert captured["query_text"] == "描述一下"
+    assert svc.bot.downloaded_file_ids == []
