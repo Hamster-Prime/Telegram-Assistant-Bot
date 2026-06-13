@@ -41,7 +41,8 @@ class FakeBot:
     async def send_message(self, chat_id, text, **kw):
         self.messages.append((chat_id, text))
 
-        class M: message_id = 555
+        class M:
+            message_id = 555
         return M()
 
     async def edit_message_text(self, text, chat_id=None, message_id=None,

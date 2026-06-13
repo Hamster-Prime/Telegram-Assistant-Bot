@@ -28,6 +28,7 @@ async def client_env():
     svc.workers.finalize_video = AsyncMock()
     svc.workers.handle_video_failed_callback = AsyncMock()
     svc.settings.webhook_secret = "s3cret"
+    svc.settings.mmx_callback_secret = ""  # 默认不校验(向后兼容)
 
     bot = Bot("12345:TEST_FAKE_TOKEN")
     dp = Dispatcher()
@@ -127,3 +128,68 @@ async def test_webhook_requires_secret(client_env):
     client, _, _ = client_env
     resp = await client.post("/tg/s3cret", json={"update_id": 1})
     assert resp.status in (401, 403)
+
+
+# ── 回调端点鉴权(mmx_callback_secret 配置时启用) ──────────────
+
+@pytest.fixture
+async def secured_client_env():
+    """配了 mmx_callback_secret 的回调端点环境。"""
+    db = Database(":memory:", wal=False)
+    await db.connect()
+    daos = DAOBundle(db)
+    registry = TaskRegistry()
+
+    svc = MagicMock()
+    svc.daos = daos
+    svc.registry = registry
+    svc.mmx.key_count = 1
+    svc.workers.finalize_video = AsyncMock()
+    svc.workers.handle_video_failed_callback = AsyncMock()
+    svc.settings.webhook_secret = "s3cret"
+    svc.settings.mmx_callback_secret = "cb-secret-xyz"
+
+    bot = Bot("12345:TEST_FAKE_TOKEN")
+    dp = Dispatcher()
+    app = build_app(dp, bot, svc)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    yield client, daos, svc
+    await client.close()
+    await registry.shutdown()
+    await bot.session.close()
+    await db.close()
+
+
+async def test_callback_rejected_without_secret(secured_client_env):
+    """配了 secret 时,缺少/错误 token 的回调被拒(401),不触发回填。"""
+    client, daos, svc = secured_client_env
+    gen = Generation(id=None, user_id=1, chat_id=1, kind="video", model="m",
+                     prompt="p", status="processing", task_id="t-sec")
+    await daos.generations.create(gen)
+    resp = await client.post("/mmx/callback", json={
+        "task_id": "t-sec", "status": "success", "file_id": "f"})
+    assert resp.status == 401
+    await _drain(svc.registry)
+    svc.workers.finalize_video.assert_not_awaited()
+
+
+async def test_callback_rejected_with_wrong_secret(secured_client_env):
+    client, _, svc = secured_client_env
+    resp = await client.post("/mmx/callback?token=wrong", json={
+        "task_id": "t-sec", "status": "success", "file_id": "f"})
+    assert resp.status == 401
+    svc.workers.finalize_video.assert_not_awaited()
+
+
+async def test_callback_accepted_with_correct_secret(secured_client_env):
+    client, daos, svc = secured_client_env
+    gen = Generation(id=None, user_id=1, chat_id=1, kind="video", model="m",
+                     prompt="p", status="processing", task_id="t-ok")
+    await daos.generations.create(gen)
+    resp = await client.post("/mmx/callback?token=cb-secret-xyz", json={
+        "task_id": "t-ok", "status": "success", "file_id": "f"})
+    assert resp.status == 200
+    await _drain(svc.registry)
+    svc.workers.finalize_video.assert_awaited_once()

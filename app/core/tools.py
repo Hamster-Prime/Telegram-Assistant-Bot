@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from app.logging import get_logger
 from app.utils.clock import format_now

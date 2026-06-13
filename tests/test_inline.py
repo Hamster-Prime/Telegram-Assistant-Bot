@@ -87,8 +87,9 @@ async def test_unauthorized_returns_denied(svc):
     results = args[0]
     assert len(results) == 1
     assert "未授权" in results[0].title
-    # 未授权结果缓存较久(避免重复打审计)
-    assert kwargs.get("cache_time") == 300
+    # 未授权结果不缓存(is_personal):授权后即时生效
+    assert kwargs.get("cache_time") == 0
+    assert kwargs.get("is_personal") is True
 
 
 async def test_none_user_returns_denied(svc):

@@ -28,7 +28,7 @@ class DuckDuckGoProvider:
                 asyncio.to_thread(self._search_sync, query, count),
                 timeout=self._timeout + 4,
             )
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             raise ProviderError("DuckDuckGo 搜索超时") from e
         except Exception as e:
             raise ProviderError(f"DuckDuckGo 搜索异常: {e}") from e

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -42,6 +43,32 @@ _CODE_MEANING = {
 _NON_RETRYABLE_CODES = {1026, 2013, 1042}
 
 
+def _parse_minimax_error(body_text: str) -> tuple[int, str]:
+    """从 4xx 响应体解析 MiniMax 错误码与消息。
+
+    兼容两种形态:
+    - 网关/OpenAI 风格:{"error": {"message": "input new_sensitive (1026)"}}
+    - MiniMax base_resp:{"base_resp": {"status_code": 1026, "status_msg": "..."}}
+    解析不出错误码时返回 (0, 截断原文)。
+    """
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, ValueError):
+        return 0, body_text[:200]
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message", "") or ""
+            m = re.search(r"\((\d{3,4})\)", msg)
+            if m:
+                return int(m.group(1)), msg
+            return 0, msg or body_text[:200]
+        base = data.get("base_resp")
+        if isinstance(base, dict) and base.get("status_code"):
+            return int(base["status_code"]), base.get("status_msg", "") or ""
+    return 0, body_text[:200]
+
+
 def mask_key(key: str) -> str:
     """日志中脱敏显示 key:前8后4。"""
     if len(key) <= 16:
@@ -63,6 +90,15 @@ class MiniMaxError(Exception):
     def retryable(self) -> bool:
         """是否值得重试/换 key。"""
         return self.code not in _NON_RETRYABLE_CODES
+
+    def user_message(self) -> str:
+        """面向用户的中文提示(供 agent / errors 统一调用)。"""
+        if self.code == 1026:
+            return ("🚫 抱歉,本次涉及的内容被判定为敏感信息,无法处理啦~"
+                    "换个说法或换个话题再试试看哦。")
+        if self.code == 1008:
+            return "❌ MiniMax 账户余额不足,请联系管理员充值。"
+        return f"❌ MiniMax 服务错误(code={self.code}):{self.msg}"
 
 
 class AllKeysFailedError(Exception):
@@ -145,6 +181,11 @@ class MiniMaxClient:
             raise MiniMaxError(1002, "HTTP 429 限流")
         if resp.status_code >= 500:
             raise MiniMaxError(1002, f"HTTP {resp.status_code} 服务端错误")
+        if resp.status_code >= 400:
+            # 其余 4xx(尤其 422 内容审核 1026):读 body 解析错误码,按请求级错误处理。
+            # 无法解析则默认 2013(请求参数错误,非可重试)—— 4xx 换 key 无意义。
+            code, emsg = _parse_minimax_error(resp.text)
+            raise MiniMaxError(code or 2013, emsg or f"HTTP {resp.status_code} 请求错误")
         resp.raise_for_status()
         data = resp.json()
         self._check_base_resp(data)
@@ -234,6 +275,13 @@ class MiniMaxClient:
                             raise MiniMaxError(1002, "HTTP 429 限流")
                         if resp.status_code >= 500:
                             raise MiniMaxError(1002, f"HTTP {resp.status_code} 服务端错误")
+                        if resp.status_code >= 400:
+                            # 其余 4xx(尤其 422 内容审核 1026):读 body 解析错误码,
+                            # 按请求级错误处理(非可重试),不再烧 key。
+                            body = (await resp.aread()).decode("utf-8", "replace")
+                            code, emsg = _parse_minimax_error(body)
+                            raise MiniMaxError(code or 2013,
+                                               emsg or f"HTTP {resp.status_code} 请求错误")
                         resp.raise_for_status()
                         async for line in resp.aiter_lines():
                             line = line.strip()

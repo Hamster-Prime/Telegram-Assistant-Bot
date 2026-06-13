@@ -52,7 +52,7 @@ class SearchRouter:
             return await asyncio.wait_for(
                 self._search_chain(query, count), timeout=self.OVERALL_TIMEOUT_S
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.error("搜索整体超时", 查询=query[:50], 上限秒=self.OVERALL_TIMEOUT_S)
             raise AllProvidersFailed(query, "整体超时")
 
@@ -74,8 +74,7 @@ class SearchRouter:
                     # 空结果视为失利
                     failures.append(f"{provider.name}#{attempt}:空结果")
                     log.warning("搜索源返回空结果", 搜索源=provider.name, 尝试=attempt)
-                except (ProviderError, httpx.TimeoutException, httpx.HTTPError,
-                        asyncio.TimeoutError) as e:
+                except (TimeoutError, ProviderError, httpx.TimeoutException, httpx.HTTPError) as e:
                     failures.append(f"{provider.name}#{attempt}:{type(e).__name__} {e}")
                     log.warning("搜索源调用失败", 搜索源=provider.name, 尝试=attempt,
                                 异常类型=type(e).__name__, 详情=str(e)[:200],

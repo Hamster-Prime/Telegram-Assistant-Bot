@@ -105,7 +105,7 @@ async def test_task_registry_logs_crash():
     async def boom():
         raise RuntimeError("炸了")
 
-    t = reg.spawn(boom(), name="boom")
+    reg.spawn(boom(), name="boom")
     await asyncio.sleep(0.05)
     assert reg.count == 0  # 异常任务被回收且不挂掉进程
 
@@ -124,3 +124,62 @@ async def test_user_lock_serializes():
     # 串行:in/out 成对出现,不交错
     assert order in (["a-in", "a-out", "b-in", "b-out"],
                      ["b-in", "b-out", "a-in", "a-out"])
+
+
+# ── 资源回收(防内存泄漏) ─────────────────────────────────────
+
+async def test_guard_reclaims_user_semaphore_after_release():
+    """用户所有槽释放后,per-user 信号量与计数应被回收,不无界增长。"""
+    guard = ConcurrencyGuard(max_chats=10, max_generations=2, per_user=3)
+
+    async with guard.chat_slot(12345):
+        assert 12345 in guard._user_sems  # 持有期间存在
+    # 退出后:无活跃槽 → 应清理
+    assert 12345 not in guard._user_sems
+    assert 12345 not in guard._user_active
+
+
+async def test_guard_no_leak_across_many_users():
+    """大量不同用户各跑一次后,内部 dict 不残留条目。"""
+    guard = ConcurrencyGuard(max_chats=50, max_generations=10, per_user=3)
+
+    async def job(uid: int):
+        async with guard.chat_slot(uid):
+            await asyncio.sleep(0)
+
+    await asyncio.gather(*[job(uid) for uid in range(200)])
+    assert len(guard._user_sems) == 0
+    assert len(guard._user_active) == 0
+
+
+async def test_guard_keeps_semaphore_while_user_has_active_slot():
+    """同一用户多个并发槽:仍有活跃槽时不得提前回收信号量。"""
+    guard = ConcurrencyGuard(max_chats=10, max_generations=2, per_user=3)
+    inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder():
+        async with guard.chat_slot(7):
+            inside.set()
+            await release.wait()
+
+    async def checker():
+        await inside.wait()
+        async with guard.chat_slot(7):  # 第二个槽
+            assert 7 in guard._user_sems
+        # 还有 holder 持有 → 不应被回收
+        assert 7 in guard._user_sems
+        release.set()
+
+    await asyncio.gather(holder(), checker())
+    # 全部释放后回收
+    assert 7 not in guard._user_sems
+
+
+async def test_user_lock_reclaims_after_release():
+    """UserLock 在无人持有后回收锁对象,不无界增长。"""
+    locks = UserLock()
+    async with locks.for_user(999):
+        pass
+    await asyncio.sleep(0)
+    assert 999 not in locks._locks

@@ -140,3 +140,44 @@ def test_window_expired_helper():
     q2 = Quota(user_id=1, mode="tokens", period="total", limit_val=100,
                window_start=now_ts - 999999)
     assert not _window_expired(q2, now_ts)  # total 永不重置
+
+
+async def test_settle_writes_quota_and_usage(daos: DAOBundle, settings: Settings):
+    """结算同时落配额与 usage_log 流水。"""
+    qm = QuotaManager(daos, settings)
+    await daos.users.upsert_basic(5, "u5", "U5")
+    user = await daos.users.get(5)
+    await daos.quotas.set(5, "tokens", 100000, "day")
+
+    await qm.settle(user, "tokens", 123, chat_id=7, kind="chat")
+
+    q = await daos.quotas.get(5, "tokens")
+    assert q.used == 123
+    stats = await daos.usage.stats(since=0)
+    assert any(s["kind"] == "chat" and (s["Token量"] or 0) == 123 for s in stats)
+
+
+async def test_settle_atomic_quota_and_usage(daos: DAOBundle, settings: Settings):
+    """配额更新与 usage 流水原子:usage 写入失败时配额不应被单独提交。"""
+    qm = QuotaManager(daos, settings)
+    await daos.users.upsert_basic(6, "u6", "U6")
+    user = await daos.users.get(6)
+    await daos.quotas.set(6, "tokens", 100000, "day")
+
+    # 注入:让事务内的 usage 插入抛错(模拟写流水失败)
+    import app.core.quota as quota_mod
+    orig = quota_mod.QuotaManager._usage_insert_sql
+
+    def boom(self, mode, amount, chat_id, kind):
+        raise RuntimeError("usage insert failed")
+
+    quota_mod.QuotaManager._usage_insert_sql = boom
+    try:
+        with pytest.raises(RuntimeError):
+            await qm.settle(user, "tokens", 999, chat_id=7, kind="chat")
+    finally:
+        quota_mod.QuotaManager._usage_insert_sql = orig
+
+    # 原子性:usage 失败 → 配额回滚,used 仍为 0
+    q = await daos.quotas.get(6, "tokens")
+    assert q.used == 0

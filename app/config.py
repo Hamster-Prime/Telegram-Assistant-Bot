@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     minimax_api_key: str = ""  # 兼容旧配置(单个 key)
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     mmx_callback_url: str = ""
+    # 回调端点鉴权:非空时,/mmx/callback 要求 ?token=<本值> 匹配,否则拒绝。
+    # 留空(默认)= 不校验(向后兼容)。建议生产配一个随机串。
+    mmx_callback_secret: str = ""
 
     # ── 模型 ───────────────────────────────────────────────────
     model_chat: str = "MiniMax-M3"
@@ -57,7 +60,7 @@ class Settings(BaseSettings):
     default_quota_mode: str = "tokens"  # tokens | calls
     default_quota_limit: int = 200_000  # -1 = 无限
     default_quota_period: str = "day"  # day | month | total
-    gen_call_weights: str = "image:1,video:5,music:5,tts:1,search:1"
+    gen_call_weights: str = "image:1,video:5,music:5,tts:1,search:1,fetch:1"
 
     # ── 并发 / 背压 ────────────────────────────────────────────
     max_concurrent_chats: int = 32
@@ -92,11 +95,32 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
-    def _merge_legacy_key(self) -> "Settings":
+    def _merge_legacy_key(self) -> Settings:
         # 旧的单 Key 变量并入多 Key 列表(若多 Key 未配置)
         if not self.minimax_api_keys.strip() and self.minimax_api_key.strip():
             self.minimax_api_keys = self.minimax_api_key.strip()
         return self
+
+    def validate_for_startup(self) -> list[str]:
+        """启动前的强校验。返回错误消息列表(空 = 通过)。
+
+        与 pydantic 字段校验区分:这些是"配置虽合法但不安全/不完整"的检查,
+        由 main.py 在启动时调用,任一非空即拒绝启动。
+        """
+        errors: list[str] = []
+        if not self.bot_token.strip():
+            errors.append("缺少 BOT_TOKEN(复制 .env.example 为 .env 并填写)")
+        if not self.minimax_keys:
+            errors.append("缺少 MINIMAX_API_KEYS(逗号分隔填写至少一个)")
+        if self.mode == "webhook":
+            if not self.webhook_host.strip():
+                errors.append("webhook 模式必须配置 WEBHOOK_HOST(TLS 由反代提供)")
+            secret = self.webhook_secret.strip()
+            if not secret or secret == "secret":
+                errors.append(
+                    "webhook 模式必须配置足够随机的 WEBHOOK_SECRET"
+                    "(不能为空或默认值 'secret',否则 webhook 入口可被伪造)")
+        return errors
 
     # ── 派生属性 ───────────────────────────────────────────────
     @property

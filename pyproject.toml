@@ -20,7 +20,27 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.6",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["data", ".venv"]
+
+[tool.ruff.lint]
+# 基础规则集:pyflakes/pycodestyle/导入排序/现代化语法
+select = ["F", "E", "W", "I", "UP"]
+ignore = [
+    "E501",  # 行长由 formatter 管,lint 不强制
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试允许未用 import(fixture 注入)与 *
+"tests/**/*.py" = ["F401", "F403"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

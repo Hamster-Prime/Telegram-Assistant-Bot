@@ -314,15 +314,20 @@ class GenerationDAO:
         sets = ["status=?"]
         params: list[Any] = [status]
         if task_id is not None:
-            sets.append("task_id=?"); params.append(task_id)
+            sets.append("task_id=?")
+            params.append(task_id)
         if file_id is not None:
-            sets.append("file_id=?"); params.append(file_id)
+            sets.append("file_id=?")
+            params.append(file_id)
         if result_url is not None:
-            sets.append("result_url=?"); params.append(result_url)
+            sets.append("result_url=?")
+            params.append(result_url)
         if error is not None:
-            sets.append("error=?"); params.append(error)
+            sets.append("error=?")
+            params.append(error)
         if finished:
-            sets.append("finished_at=?"); params.append(_now())
+            sets.append("finished_at=?")
+            params.append(_now())
         params.append(gen_id)
         await self.db.execute(f"UPDATE generations SET {', '.join(sets)} WHERE id=?", tuple(params))
         log.info("生成任务状态更新", 编号=gen_id, 新状态=status, 错误=error or "无")

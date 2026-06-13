@@ -44,12 +44,13 @@ async def test_system_prompt_instructs_direct_html_output(daos: DAOBundle):
     msgs = await cb.build(100, 1, "说明格式要求")
     system = msgs[0]["content"]
 
-    assert "直接以 HTML 发送到 Telegram" in system
+    # 提示词约束模型直出 Telegram HTML(措辞可演进,这里断言稳定要点)
+    assert "parse_mode=HTML" in system
+    assert "Markdown" in system and "禁止" in system
     assert "<blockquote expandable>" in system
     assert "<code>" in system
     assert "<pre>" in system
     assert "<tg-spoiler>" in system
-    assert "不要输出 Markdown" in system
     assert "&lt;" in system  # 转义规则
 
 

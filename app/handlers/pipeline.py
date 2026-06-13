@@ -142,11 +142,15 @@ def build_dispatcher(
         return f"搜索结果(来源 {source}):\n" + "\n".join(lines)
 
     async def web_fetch(args: dict[str, Any]) -> str:
+        check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("fetch"))
+        if not check.ok:
+            return check.denial_text()
         try:
             md = await svc.search.fetch(args["url"])
         except AllProvidersFailed as e:
             return e.user_message()
-        await svc.daos.usage.add(user.tg_id, chat_id, "fetch")
+        await svc.quota.settle(user, "calls", svc.quota.call_weight("fetch"),
+                               chat_id=chat_id, kind="fetch")
         return f"网页正文(markdown):\n{md}"
 
     async def save_memory(args: dict[str, Any]) -> str:

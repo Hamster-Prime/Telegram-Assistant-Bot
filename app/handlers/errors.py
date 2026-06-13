@@ -28,9 +28,7 @@ async def on_error(event: ErrorEvent) -> bool:
         log.error("全局异常:所有MiniMax Key失败", 会话=chat_id,
                   尝试明细=len(exc.attempts))
     elif isinstance(exc, MiniMaxError):
-        user_text = f"❌ MiniMax 服务错误(code={exc.code}):{exc.msg}"
-        if exc.code == 1008:
-            user_text = "❌ MiniMax 账户余额不足,请联系管理员充值。"
+        user_text = exc.user_message()
         log.error("全局异常:MiniMax业务错误", 会话=chat_id, 错误码=exc.code,
                   详情=exc.msg, 追踪ID=exc.trace_id)
     elif isinstance(exc, AllProvidersFailed):

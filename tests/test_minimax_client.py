@@ -9,7 +9,13 @@ import json
 import httpx
 import pytest
 
-from app.minimax.client import AllKeysFailedError, MiniMaxClient, MiniMaxError, mask_key
+from app.minimax.client import (
+    AllKeysFailedError,
+    MiniMaxClient,
+    MiniMaxError,
+    _parse_minimax_error,
+    mask_key,
+)
 
 
 def make_client(keys: list[str], handler) -> MiniMaxClient:
@@ -181,3 +187,83 @@ def test_mask_key():
 def test_keys_required():
     with pytest.raises(ValueError):
         MiniMaxClient([], base_url="https://x")
+
+
+# ── HTTP 4xx 内容审核(1026)不烧 key ─────────────────────────────
+
+async def test_http_422_sensitive_content_no_key_burn():
+    """HTTP 422 内容审核(1026):读 body 解析码,不重试不换 key,只 1 次尝试。"""
+    rec = CallRecorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rec.calls.append(rec.key_of(request))
+        return httpx.Response(422, json={
+            "error": {"type": "unprocessable_entity_error",
+                      "message": "input new_sensitive (1026)", "http_code": "422"}})
+
+    client = make_client(["k1", "k2", "k3"], handler)
+    with pytest.raises(MiniMaxError) as ei:
+        await client.post("/chat/completions", {"model": "m"})
+    assert ei.value.code == 1026
+    assert rec.calls == ["k1"]  # 只调用 1 次,没烧后续 key
+    await client.close()
+
+
+async def test_http_400_unparseable_defaults_non_retryable():
+    """无法解析错误码的 4xx:默认按非可重试(2013)处理,只 1 次尝试。"""
+    rec = CallRecorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rec.calls.append(rec.key_of(request))
+        return httpx.Response(400, text="Bad Request")
+
+    client = make_client(["k1", "k2"], handler)
+    with pytest.raises(MiniMaxError) as ei:
+        await client.post("/x", {})
+    assert ei.value.code == 2013
+    assert rec.calls == ["k1"]
+    await client.close()
+
+
+async def test_stream_422_sensitive_content_no_key_burn():
+    """流式:首块前 HTTP 422 内容审核 → 不换 key,立即抛 1026。"""
+    rec = CallRecorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        rec.calls.append(rec.key_of(request))
+        return httpx.Response(422, json={
+            "error": {"message": "input new_sensitive (1026)"}})
+
+    client = make_client(["k1", "k2"], handler)
+    with pytest.raises(MiniMaxError) as ei:
+        async for _ in client.stream_sse("/chat/completions", {}):
+            pass
+    assert ei.value.code == 1026
+    assert rec.calls == ["k1"]
+    await client.close()
+
+
+def test_parse_minimax_error_gateway_style():
+    code, msg = _parse_minimax_error(
+        '{"error":{"message":"input new_sensitive (1026)"}}')
+    assert code == 1026
+    assert "1026" in msg
+
+
+def test_parse_minimax_error_base_resp_style():
+    code, msg = _parse_minimax_error(
+        '{"base_resp":{"status_code":1042,"status_msg":"非法字符"}}')
+    assert code == 1042
+    assert msg == "非法字符"
+
+
+def test_parse_minimax_error_unparseable():
+    code, msg = _parse_minimax_error("totally not json")
+    assert code == 0
+    assert "totally not json" in msg
+
+
+def test_minimax_error_user_message_1026():
+    e = MiniMaxError(1026, "sensitive")
+    assert "敏感" in e.user_message()
+    assert MiniMaxError(1008, "x").user_message().startswith("❌")

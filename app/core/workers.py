@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiogram import Bot
 from aiogram.methods import EditMessageMedia
@@ -41,10 +41,10 @@ class GenWorkerPool:
         self,
         bot: Bot,
         daos: DAOBundle,
-        video_api: "VideoAPI",
-        music_api: "MusicAPI",
-        files_api: "FilesAPI",
-        quota: "QuotaManager",
+        video_api: VideoAPI,
+        music_api: MusicAPI,
+        files_api: FilesAPI,
+        quota: QuotaManager,
         guard: ConcurrencyGuard,
         limiter: SendRateLimiter,
         registry: TaskRegistry,

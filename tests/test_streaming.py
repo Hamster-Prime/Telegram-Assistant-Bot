@@ -11,10 +11,10 @@ from aiogram.methods import EditMessageText
 from app.core.concurrency import SendRateLimiter
 from app.core.ratelimit import EditThrottle
 from app.core.streaming import (
+    TG_MESSAGE_LIMIT,
     DraftRenderer,
     EditRenderer,
     GuestRenderer,
-    TG_MESSAGE_LIMIT,
     _render_for_telegram,
     clip,
 )
@@ -74,11 +74,19 @@ class FakeBot:
         self.edit_error: Exception | None = None
         self.edit_error_always: bool = False
         self._edit_error_fired = False
+        self.send_error: Exception | None = None
+        self.send_error_always: bool = False
+        self._send_error_fired = False
 
     async def __call__(self, method):
         self.methods.append(method)
 
     async def send_message(self, chat_id, text, **kwargs):
+        if self.send_error is not None and (
+            self.send_error_always or not self._send_error_fired
+        ):
+            self._send_error_fired = True
+            raise self.send_error
         self._next_id += 1
         self.sent.append((chat_id, text))
         self.sent_kwargs.append(kwargs)
@@ -167,6 +175,34 @@ async def test_draft_renderer_does_not_send_initial_placeholder_in_private(limit
 
     assert bot.sent == [(42, "<b>最终回复</b>")]
     assert bot.sent_kwargs[-1].get("parse_mode") == "HTML"
+
+
+async def test_draft_finalize_falls_back_to_plain_text_on_html_error(limiter):
+    """私聊定稿:HTML 解析失败时降级纯文本,不丢整条回复。"""
+    bot = FakeBot()
+    bot.send_error = TelegramBadRequest(
+        method=EditMessageText, message="Bad Request: can't parse entities")
+    r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
+    await r.start()
+    mid = await r.finalize("好的,<b>我来</b>为您生成")
+
+    # 第一次 HTML 发送失败 → 降级纯文本(parse_mode=None)成功
+    assert bot.sent, "降级后应有一条成功发送"
+    assert bot.sent_kwargs[-1].get("parse_mode") is None
+    assert "好的" in bot.sent[-1][1] and "我来" in bot.sent[-1][1]
+    assert mid is not None
+
+
+async def test_draft_finalize_swallows_persistent_error_no_raise(limiter):
+    """私聊定稿全部失败也不抛异常(避免冒泡 errors.py 覆盖消息)。"""
+    bot = FakeBot()
+    bot.send_error = TelegramBadRequest(
+        method=EditMessageText, message="can't parse entities")
+    bot.send_error_always = True
+    r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
+    await r.start()
+    mid = await r.finalize("完整回复文本")  # 不应抛出
+    assert mid is None
 
 
 # ── GuestRenderer:媒体投递 ──────────────────────────────────

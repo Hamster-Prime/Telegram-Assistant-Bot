@@ -4,9 +4,9 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiohttp import web
 
 from app.config import get_settings
 from app.core.auth import AuthMiddleware
@@ -49,11 +49,10 @@ async def run() -> None:
              MiniMaxKey数=len(settings.minimax_keys),
              对话模型=settings.model_chat)
 
-    if not settings.bot_token:
-        log.error("缺少 BOT_TOKEN,无法启动(复制 .env.example 为 .env 并填写)")
-        sys.exit(1)
-    if not settings.minimax_keys:
-        log.error("缺少 MINIMAX_API_KEYS,无法启动")
+    startup_errors = settings.validate_for_startup()
+    if startup_errors:
+        for e in startup_errors:
+            log.error("启动配置校验失败", 原因=e)
         sys.exit(1)
 
     bot = Bot(settings.bot_token,

@@ -27,19 +27,32 @@ class ConcurrencyGuard:
         self._per_user_limit = per_user
         self._user_sems: dict[int, asyncio.Semaphore] = {}
         self._user_active: dict[int, int] = defaultdict(int)
+        # 引用计数:多少个 _SlotCtx 当前引用着该用户的信号量(含排队等待中的)。
+        # 归零时才回收信号量,避免「等待者还引用着、却被另一路回收」的竞态。
+        self._user_refs: dict[int, int] = defaultdict(int)
 
-    def _user_sem(self, user_id: int) -> asyncio.Semaphore:
+    def _acquire_user_sem(self, user_id: int) -> asyncio.Semaphore:
+        """取(或建)用户信号量,并登记一次引用。"""
         sem = self._user_sems.get(user_id)
         if sem is None:
             sem = asyncio.Semaphore(self._per_user_limit)
             self._user_sems[user_id] = sem
+        self._user_refs[user_id] += 1
         return sem
 
-    def chat_slot(self, user_id: int) -> "_SlotCtx":
+    def _release_user_ref(self, user_id: int) -> None:
+        """归还一次引用;无引用时回收信号量与计数,防无界增长。"""
+        self._user_refs[user_id] -= 1
+        if self._user_refs[user_id] <= 0:
+            self._user_refs.pop(user_id, None)
+            self._user_sems.pop(user_id, None)
+            self._user_active.pop(user_id, None)
+
+    def chat_slot(self, user_id: int) -> _SlotCtx:
         """对话槽位:全局 + 单用户双重信号量。"""
         return _SlotCtx(self, self._chat_sem, user_id, kind="对话")
 
-    def generation_slot(self, user_id: int) -> "_SlotCtx":
+    def generation_slot(self, user_id: int) -> _SlotCtx:
         """生成槽位(视频/音乐等昂贵操作)。"""
         return _SlotCtx(self, self._gen_sem, user_id, kind="生成")
 
@@ -57,12 +70,13 @@ class _SlotCtx:
                  user_id: int, kind: str) -> None:
         self._guard = guard
         self._global_sem = global_sem
-        self._user_sem = guard._user_sem(user_id)
+        # 登记引用(含排队期):退出时归还,归零回收 → 杜绝按 user_id 无界增长
+        self._user_sem = guard._acquire_user_sem(user_id)
         self._user_id = user_id
         self._kind = kind
         self._t0 = 0.0
 
-    async def __aenter__(self) -> "_SlotCtx":
+    async def __aenter__(self) -> _SlotCtx:
         self._t0 = time.monotonic()
         queued = self._global_sem.locked() or self._user_sem.locked()
         if queued:
@@ -88,20 +102,47 @@ class _SlotCtx:
             self._guard._user_active.pop(self._user_id, None)
         self._global_sem.release()
         self._user_sem.release()
+        # 归还引用(可能触发回收)。必须在 release 之后,确保信号量状态已复原。
+        self._guard._release_user_ref(self._user_id)
 
 
 class UserLock:
-    """按 user_id 的轻量异步锁 —— 仅串行化关键段(如配额结算、/reset)。"""
+    """按 user_id 的轻量异步锁 —— 仅串行化关键段(如配额结算、/reset)。
+
+    用完即回收(无人持有/等待时移除),避免按 user_id 无界增长。
+    """
 
     def __init__(self) -> None:
         self._locks: dict[int, asyncio.Lock] = {}
+        self._refs: dict[int, int] = defaultdict(int)
 
-    def for_user(self, user_id: int) -> asyncio.Lock:
+    def for_user(self, user_id: int) -> _TrackedLock:
         lock = self._locks.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
             self._locks[user_id] = lock
-        return lock
+        return _TrackedLock(self, user_id, lock)
+
+
+class _TrackedLock:
+    """包装 asyncio.Lock 的异步上下文:进入登记引用,退出归还,归零回收。"""
+
+    def __init__(self, owner: UserLock, user_id: int, lock: asyncio.Lock) -> None:
+        self._owner = owner
+        self._user_id = user_id
+        self._lock = lock
+        owner._refs[user_id] += 1
+
+    async def __aenter__(self) -> asyncio.Lock:
+        await self._lock.acquire()
+        return self._lock
+
+    async def __aexit__(self, *exc) -> None:
+        self._lock.release()
+        self._owner._refs[self._user_id] -= 1
+        if self._owner._refs[self._user_id] <= 0:
+            self._owner._refs.pop(self._user_id, None)
+            self._owner._locks.pop(self._user_id, None)
 
 
 class SendRateLimiter:

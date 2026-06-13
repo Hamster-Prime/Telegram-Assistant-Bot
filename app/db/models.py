@@ -1,7 +1,7 @@
 """数据模型 —— 轻量 dataclass(配合手写 DAO,不引入重 ORM)。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(slots=True)

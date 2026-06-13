@@ -57,6 +57,14 @@ async def execute_guest_command(
     if not cmd:
         return None
 
+    # 管理类命令在 Guest 场景不可用:明确告知而非静默落入 AI 流程
+    _ADMIN_CMDS = {
+        "grant", "revoke", "setquota", "resetquota", "quotas",
+        "users", "stats", "promote", "demote", "broadcast", "audit",
+    }
+    if cmd in _ADMIN_CMDS:
+        return "ℹ️ 该管理命令请直接在与我的私聊中使用,群聊/Guest 场景不支持。"
+
     chat_id = message.chat.id
     if cmd == "start":
         return await logic_start(svc, user)

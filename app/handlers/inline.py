@@ -46,7 +46,8 @@ async def handle_inline_query(
         await query.answer(
             [_article(_id="denied", title="⛔ 未授权",
                       text="你未被授权使用本 Bot,请联系管理员开通。")],
-            cache_time=300,
+            cache_time=0,
+            is_personal=True,
         )
         return
 

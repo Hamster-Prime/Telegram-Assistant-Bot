@@ -80,9 +80,7 @@ class Agent:
                         finish = ev.finish_reason
             except (AllKeysFailedError, MiniMaxError) as e:
                 # 已流出的部分尽量定稿,再附错误说明
-                user_msg = e.user_message() if isinstance(e, AllKeysFailedError) else (
-                    f"❌ MiniMax 服务错误(code={e.code}):{e.msg}"
-                )
+                user_msg = e.user_message() if isinstance(e, (AllKeysFailedError, MiniMaxError)) else str(e)
                 log.error("Agent对话中断", 轮次=round_no, 异常类型=type(e).__name__,
                           已收文本长度=len(full_text), 报错=user_msg)
                 if full_text.strip():

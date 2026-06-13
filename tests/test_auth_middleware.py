@@ -5,12 +5,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiogram.types import Chat, InlineQuery, Message, Update
+from aiogram.types import User as TgUser
 
 from app.config import Settings
 from app.core.auth import AuthMiddleware, extract_actor
 from app.db.dao import DAOBundle
 from app.db.engine import Database
-from aiogram.types import Chat, Message, Update, User as TgUser
 
 
 def make_message(uid: int, text: str = "hi") -> Message:
@@ -33,8 +34,7 @@ def make_guest_message(caller_id: int) -> Message:
     })
 
 
-def make_inline_query(uid: int, query: str = "你好") -> "InlineQuery":
-    from aiogram.types import InlineQuery
+def make_inline_query(uid: int, query: str = "你好") -> InlineQuery:
     return InlineQuery.model_validate({
         "id": "iq-1", "query": query, "offset": "",
         "from_user": {"id": uid, "is_bot": False, "first_name": "I", "username": f"i{uid}"},

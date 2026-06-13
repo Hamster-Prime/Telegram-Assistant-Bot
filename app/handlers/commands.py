@@ -1,6 +1,7 @@
 """命令 handler —— /start /help /reset + 授权/配额/超管命令(plan §14.3)。"""
 from __future__ import annotations
 
+import json
 import time
 
 from aiogram import Router
@@ -128,6 +129,13 @@ def _scope_of(message: Message, user: User) -> tuple[str, int]:
     if message.chat.type == "private":
         return "user", user.tg_id
     return "chat", message.chat.id
+
+
+def _explicit_dispatcher(svc: Services, message: Message, user: User):
+    """显式命令复用的工具分发器(6 个生成/搜索命令共用)。"""
+    from app.handlers.pipeline import build_dispatcher
+    scope, owner = _scope_of(message, user)
+    return build_dispatcher(svc, user, message.chat.id, scope, owner)
 
 
 @router.message(Command("remember"))
@@ -392,11 +400,8 @@ async def cmd_image(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/image 图片描述")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("generate_image", _json.dumps({"prompt": command.args}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("generate_image", json.dumps({"prompt": command.args}))
     if "已生成" not in result:
         await message.answer(result)
 
@@ -407,11 +412,8 @@ async def cmd_video(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/video 视频描述")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("generate_video", _json.dumps({"prompt": command.args}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("generate_video", json.dumps({"prompt": command.args}))
     if "已入队" not in result:
         await message.answer(result)
 
@@ -422,11 +424,8 @@ async def cmd_tts(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/tts 要朗读的文本")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("synthesize_speech", _json.dumps({"text": command.args}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("synthesize_speech", json.dumps({"text": command.args}))
     if "已发送" not in result:
         await message.answer(result)
 
@@ -437,11 +436,8 @@ async def cmd_music(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/music 音乐描述")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("generate_music", _json.dumps({"prompt": command.args}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("generate_music", json.dumps({"prompt": command.args}))
     if "已入队" not in result:
         await message.answer(result)
 
@@ -452,11 +448,8 @@ async def cmd_search(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/search 搜索关键词")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("web_search", _json.dumps({"query": command.args}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("web_search", json.dumps({"query": command.args}))
     await message.answer(result[:4000])
 
 
@@ -466,9 +459,6 @@ async def cmd_fetch(message: Message, command: CommandObject, user: User,
     if not command.args:
         await message.answer("用法:/fetch 网址")
         return
-    from app.handlers.pipeline import build_dispatcher
-    import json as _json
-    scope, owner = _scope_of(message, user)
-    d = build_dispatcher(svc, user, message.chat.id, scope, owner)
-    result = await d.dispatch("web_fetch", _json.dumps({"url": command.args.strip()}))
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("web_fetch", json.dumps({"url": command.args.strip()}))
     await message.answer(result[:4000])

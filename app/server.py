@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import json
 
-from aiohttp import web
 from aiogram import Bot, Dispatcher
-from aiogram.types import Update
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 from app.logging import get_logger
 from app.services import Services
@@ -28,7 +27,15 @@ def build_app(dp: Dispatcher, bot: Bot, svc: Services) -> web.Application:
     setup_application(app, dp, bot=bot)
 
     async def mmx_callback(request: web.Request) -> web.Response:
-        """MiniMax 视频/音乐回调。先回显 challenge(3s 内),再幂等回填。"""
+        """MiniMax 视频/音乐回调。先回显 challenge(3s 内),再幂等回填。
+
+        鉴权:若配置了 mmx_callback_secret,要求 ?token=<secret> 匹配,否则 401。
+        """
+        secret = settings.mmx_callback_secret
+        if secret and request.query.get("token") != secret:
+            log.warning("MiniMax回调:鉴权失败(token 不匹配),拒绝",
+                        来源=request.remote or "?")
+            return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -81,5 +88,5 @@ def build_app(dp: Dispatcher, bot: Bot, svc: Services) -> web.Application:
     app.router.add_post("/mmx/callback", mmx_callback)
     app.router.add_get("/healthz", healthz)
     log.info("aiohttp路由已注册",
-             Webhook路径=f"/tg/<secret>", 回调路径="/mmx/callback")
+             Webhook路径="/tg/<secret>", 回调路径="/mmx/callback")
     return app

@@ -118,7 +118,7 @@ async def _run_typing_loop(
                 log.debug("typing刷新失败(忽略)", 会话=chat_id, 错误=str(e)[:100])
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=refresh_s)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
     except asyncio.CancelledError:
         raise
@@ -182,7 +182,6 @@ class DraftRenderer:
     """私聊:sendMessageDraft 原生草稿流。
 
     草稿是临时预览(~30s),不自动落地;必须窗口内 sendMessage 定稿。
-    Telegram 服务端不支持时自动退化为占位+编辑流。
 
     typing 策略:首 token 到达前发 typing 填补「无预览」的空白;
     一旦首个 draft 预览成功发出(draft 自带流式预览),停止 typing 任务。
@@ -197,8 +196,6 @@ class DraftRenderer:
         self._draft_id = secrets.randbelow(2**31 - 1) + 1
         # 草稿更新比编辑廉价,节流间隔取 1/3
         self._throttle = EditThrottle(throttle_ms=max(300, throttle_ms // 3))
-        self._draft_supported = True
-        self._fallback: EditRenderer | None = None
         self._typing_refresh_s = typing_refresh_s
         self._typing_stop: asyncio.Event | None = None
         self._typing_task: asyncio.Task | None = None
@@ -234,10 +231,6 @@ class DraftRenderer:
         self._typing_stop = None
 
     async def update(self, full_text: str) -> None:
-        if not self._draft_supported:
-            assert self._fallback is not None
-            await self._fallback.update(full_text)
-            return
         if not self._throttle.should_commit(full_text):
             return
         try:
@@ -258,10 +251,9 @@ class DraftRenderer:
     async def finalize(self, full_text: str) -> int | None:
         await self._stop_typing()
         text = clip(full_text) or "(空回复)"
-        if not self._draft_supported:
-            assert self._fallback is not None
-            return await self._fallback.finalize(full_text)
-        while True:
+        # 防弹化定稿:HTML 失败降级纯文本,限流退避,最终失败不抛出(避免冒泡 errors.py)
+        last_exc: Exception | None = None
+        for attempt in range(3):
             try:
                 await self._limiter.acquire()
                 msg = await self._bot.send_message(
@@ -273,7 +265,31 @@ class DraftRenderer:
                          长度=len(text))
                 return msg.message_id
             except TelegramRetryAfter as e:
+                last_exc = e
                 await _sleep_retry_after(e)
+            except TelegramBadRequest as e:
+                msg_str = str(e)
+                if "entities" in msg_str or "parse" in msg_str or "tag" in msg_str:
+                    log.warning("私聊定稿HTML解析失败,降级纯文本", 会话=self._chat_id,
+                                错误=msg_str[:120])
+                    try:
+                        await self._limiter.acquire()
+                        m = await self._bot.send_message(
+                            self._chat_id, html.escape(text), parse_mode=None)
+                        self._last_rendered = full_text
+                        return m.message_id
+                    except TelegramRetryAfter as re_:
+                        last_exc = re_
+                        await _sleep_retry_after(re_)
+                        continue
+                    except Exception as e2:
+                        last_exc = e2
+                        continue
+                last_exc = e
+                continue
+        log.error("私聊回复定稿最终失败(消息可能未送达)", 会话=self._chat_id,
+                  错误=str(last_exc)[:160] if last_exc else "未知")
+        return None
 
     async def fail(self, error_text: str) -> None:
         await self._stop_typing()
@@ -338,7 +354,7 @@ class _TickLoopMixin:
                 # 等到下一个 tick(或停止信号)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except asyncio.CancelledError:
             raise
