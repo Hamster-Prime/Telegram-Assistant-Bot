@@ -39,15 +39,18 @@ async def test_system_prompt_requires_search_for_fresh_factual_questions(daos: D
     assert "不能只说" in system and "去搜索" in system
 
 
-async def test_system_prompt_limits_output_to_telegram_supported_format(daos: DAOBundle):
+async def test_system_prompt_instructs_direct_html_output(daos: DAOBundle):
     cb = ContextBuilder(daos)
     msgs = await cb.build(100, 1, "说明格式要求")
     system = msgs[0]["content"]
 
-    assert "Telegram 支持的格式" in system
-    assert "不要使用 Markdown 标题" in system
-    assert "# 标题" in system
-    assert "不要输出井号" in system
+    assert "直接以 HTML 发送到 Telegram" in system
+    assert "<blockquote expandable>" in system
+    assert "<code>" in system
+    assert "<pre>" in system
+    assert "<tg-spoiler>" in system
+    assert "不要输出 Markdown" in system
+    assert "&lt;" in system  # 转义规则
 
 
 async def test_context_includes_memory_and_summary(daos: DAOBundle):
