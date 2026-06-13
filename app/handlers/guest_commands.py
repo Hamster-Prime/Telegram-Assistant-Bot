@@ -72,7 +72,7 @@ async def execute_guest_command(
         "users", "stats", "promote", "demote", "broadcast", "audit",
     }
     if cmd in _ADMIN_CMDS:
-        return "ℹ️ 该管理命令请直接在与我的私聊中使用,群聊/Guest 场景不支持。"
+        return "ℹ️ 该管理命令请直接在与我的私聊中使用。"
 
     # 分页列表命令:Guest inline 消息键盘状态脆弱,提示去私聊
     if cmd in _PRIVATE_ONLY_CMDS:
