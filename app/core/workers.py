@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 from app.core.concurrency import ConcurrencyGuard, SendRateLimiter, TaskRegistry
+from app.core.htmlfmt import sanitize_telegram_html
 from app.db.dao import DAOBundle
 from app.db.models import Generation, User
 from app.logging import get_logger
@@ -144,9 +145,11 @@ class GenWorkerPool:
             log.info("视频回填开始", 生成编号=gen_id, 文件ID=file_id, 来源=source)
             url = await self._files.retrieve_url(file_id)
             caption = f"🎬 视频已生成:{gen.prompt[:100]}"
+            html_caption = sanitize_telegram_html(caption)
             if gen.inline_message_id:
                 # Guest:inline editMessageMedia(URL),失败降级为文本+链接
-                media = InputMediaVideo(media=url, caption=caption)
+                media = InputMediaVideo(media=url, caption=html_caption,
+                                        parse_mode="HTML")
                 ok = await self._edit_inline_media(gen.inline_message_id, media)
                 if not ok:
                     await self._edit_inline_text(
@@ -159,7 +162,8 @@ class GenWorkerPool:
                 await self._bot.send_video(
                     gen.chat_id,
                     BufferedInputFile(data, filename=f"video_{gen_id}.mp4"),
-                    caption=caption,
+                    caption=html_caption,
+                    parse_mode="HTML",
                 )
             await self._daos.generations.update_status(
                 gen_id, "success", file_id=file_id, result_url=url, finished=True
@@ -223,12 +227,14 @@ class GenWorkerPool:
             if gen is None:
                 return
             caption = f"🎵 音乐已生成:{prompt[:100]}"
+            html_caption = sanitize_telegram_html(caption)
             if gen.inline_message_id:
                 # Guest:inline editMessageMedia(URL),失败降级为文本+链接
                 url = audio_url
                 if not url:
                     raise RuntimeError("Guest 模式音乐回填需要 URL,未返回")
-                media = InputMediaAudio(media=url, caption=caption)
+                media = InputMediaAudio(media=url, caption=html_caption,
+                                        parse_mode="HTML")
                 ok = await self._edit_inline_media(gen.inline_message_id, media)
                 if not ok:
                     await self._edit_inline_text(
@@ -239,14 +245,16 @@ class GenWorkerPool:
                     await self._bot.send_audio(
                         gen.chat_id,
                         BufferedInputFile(audio_bytes, filename=f"music_{gen_id}.mp3"),
-                        caption=caption,
+                        caption=html_caption,
+                        parse_mode="HTML",
                     )
                 elif audio_url:
                     data = await self._files.download(audio_url)
                     await self._bot.send_audio(
                         gen.chat_id,
                         BufferedInputFile(data, filename=f"music_{gen_id}.mp3"),
-                        caption=caption,
+                        caption=html_caption,
+                        parse_mode="HTML",
                     )
                 else:
                     raise RuntimeError("MiniMax 未返回音频数据")
@@ -268,7 +276,8 @@ class GenWorkerPool:
         try:
             await self._limiter.acquire()
             await self._bot.edit_message_text(
-                text, chat_id=gen.chat_id, message_id=gen.placeholder_msg_id,
+                sanitize_telegram_html(text), chat_id=gen.chat_id,
+                message_id=gen.placeholder_msg_id, parse_mode="HTML",
             )
         except Exception as e:
             log.debug("占位消息编辑失败(忽略)", 生成编号=gen.id, 错误=str(e)[:120])
@@ -287,11 +296,12 @@ class GenWorkerPool:
             return False
 
     async def _edit_inline_text(self, inline_message_id: str, text: str) -> None:
-        """Guest:编辑 inline 消息文本(媒体回填降级 / 失败提示)。纯文本,裸 URL 自动链接。"""
+        """Guest:编辑 inline 消息文本(媒体回填降级 / 失败提示)。HTML 模式,经 sanitize 清洗。"""
         try:
             await self._limiter.acquire()
             await self._bot.edit_message_text(
-                text, inline_message_id=inline_message_id,
+                sanitize_telegram_html(text), inline_message_id=inline_message_id,
+                parse_mode="HTML",
             )
         except Exception as e:
             log.debug("Guest inline 文本编辑失败(忽略)", 错误=str(e)[:120])
@@ -313,7 +323,8 @@ class GenWorkerPool:
             else:
                 try:
                     await self._limiter.acquire()
-                    await self._bot.send_message(gen.chat_id, text)
+                    await self._bot.send_message(
+                        gen.chat_id, sanitize_telegram_html(text), parse_mode="HTML")
                 except Exception as e:
                     log.error("失败通知发送失败", 生成编号=gen_id, 错误=str(e)[:120])
         log.warning("生成任务标记失败", 生成编号=gen_id, 类型=gen.kind, 原因=reason[:200])
