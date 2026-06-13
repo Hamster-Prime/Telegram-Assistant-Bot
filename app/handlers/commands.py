@@ -8,6 +8,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
 from app.core.auth import require_role
+from app.core.htmlfmt import sanitize_telegram_html
 from app.db.models import User
 from app.handlers.commands_registry import build_help_text
 from app.logging import get_logger
@@ -350,7 +351,9 @@ async def cmd_broadcast(message: Message, command: CommandObject, user: User,
     for uid in ids:
         try:
             await svc.limiter.acquire()
-            await svc.bot.send_message(uid, f"📢 管理员广播:\n{command.args}")
+            await svc.bot.send_message(
+                uid, sanitize_telegram_html(f"📢 管理员广播:\n{command.args}"),
+                parse_mode="HTML")
             sent += 1
         except Exception:
             failed += 1
