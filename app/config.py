@@ -70,7 +70,15 @@ class Settings(BaseSettings):
     # ── 行为 / 存储 ────────────────────────────────────────────
     default_token_budget: int = 128_000
     compact_trigger_ratio: float = 0.6
-    edit_throttle_ms: int = 1500
+    # 编辑节流(按场景,贴近 Telegram 硬限避免 429):
+    #   单聊/Guest inline ≤1 条/秒 → EDIT_THROTTLE_MS=1000
+    #   群聊 ≤20 条/分钟 ≈3 秒/次 → GROUP_EDIT_THROTTLE_MS=3000
+    # 该间隔是「同一消息任意两次编辑(内容更新或光标闪烁)的最短间隔」,
+    # 由统一轮询循环强制执行。
+    edit_throttle_ms: int = 1000
+    group_edit_throttle_ms: int = 3000
+    # typing 状态刷新间隔:status 维持约 5 秒,留 1 秒余量
+    typing_refresh_s: float = 4.0
     db_path: str = "./data/bot.db"
     sqlite_wal: bool = True
     log_level: str = "INFO"

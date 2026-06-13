@@ -72,7 +72,8 @@ async def process_guest_message(message: Message, user: User, svc: Services) -> 
         # 兜底:无 guest_query_id 时按普通编辑流(回复原消息)
         renderer = EditRenderer(svc.bot, message.chat.id, svc.limiter,
                                 throttle_ms=svc.settings.edit_throttle_ms,
-                                reply_to_message_id=message.message_id)
+                                reply_to_message_id=message.message_id,
+                                typing_refresh_s=svc.settings.typing_refresh_s)
 
     # Guest 不落历史(收不到后续消息,持久化意义有限),记忆走 scope=chat
     await run_chat_pipeline(svc, user, message, content, renderer,

@@ -27,6 +27,10 @@ class FakeRenderer:
     async def fail(self, t: str):
         self.failed = t
 
+    @property
+    def last_rendered_text(self) -> str:
+        return self.final or ""
+
 
 class ScriptedChat:
     """按脚本回放流式事件;记录每轮收到的 messages。"""
@@ -170,11 +174,11 @@ async def test_show_thinking_renders_quote():
     assert "答案" in r.final
 
 
-async def test_preamble_preserved_across_tool_round():
-    """工具调用前的前导语(如"好的,我来帮您查询")不能在工具轮后丢失。
+async def test_preamble_replaced_by_final_answer_per_round():
+    """覆盖式渲染:工具调用前的前导语在新轮开始时被覆盖,最终只留末轮完整答案。
 
-    回归:此前每轮 full_text 重置,工具轮前导语被丢弃,最终只剩末轮文本,
-    在 Guest 单 inline 消息 + persist=False 下表现为首句被截断。
+    体验:第1轮显示"好的,我来帮您查询。" → 工具执行 → 第2轮覆盖为"现在是白天"。
+    入 convo 的 assistant 消息仍按真实轮次内容(供模型看完整工具历史)。
     """
     chat = ScriptedChat([
         [  # 第一轮:先说前导语,再发起工具调用
@@ -184,7 +188,7 @@ async def test_preamble_preserved_across_tool_round():
                                                       arguments="{}")]),
             ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
         ],
-        [  # 第二轮:基于工具结果回答
+        [  # 第二轮:基于工具结果回答(覆盖第1轮显示)
             ChatStreamEvent(kind="content", text="现在是白天"),
             ChatStreamEvent(kind="usage", total_tokens=10),
             ChatStreamEvent(kind="finish", finish_reason="stop"),
@@ -195,23 +199,21 @@ async def test_preamble_preserved_across_tool_round():
     result = await agent.run([{"role": "user", "content": "几点了"}], r,
                              ToolDispatcher())
 
-    # 前导语必须保留在最终结果里
-    assert "好的,我来帮您查询。" in result.text
-    assert "现在是白天" in result.text
-    # 定稿文本同样保留前导语
-    assert r.final is not None
-    assert "好的,我来帮您查询。" in r.final
-    assert "现在是白天" in r.final
-    # 流式更新里也应该出现前导语
+    # 最终结果只含末轮答案(前导语已被覆盖,不累积)
+    assert result.text == "现在是白天"
+    assert "好的,我来帮您查询。" not in result.text
+    # 定稿文本即末轮
+    assert r.final == "现在是白天"
+    # 流式更新里第1轮确实短暂显示过前导语(后被覆盖)
     assert any("好的,我来帮您查询。" in u for u in r.updates)
-    # 入会话的 assistant 消息 content 仍是本轮原始前导语(不含续写)
+    # 入会话的 assistant 消息 content 仍是本轮原始前导语(模型需看完整工具历史)
     second = chat.seen_messages[1]
     assistant = next(m for m in second if m["role"] == "assistant")
     assert assistant["content"] == "好的,我来帮您查询。"
 
 
-async def test_multiple_tool_rounds_accumulate_all_preamble():
-    """连续两轮工具调用 → 两轮前导语都保留 + 末轮回答。"""
+async def test_multiple_tool_rounds_overwrite_display():
+    """连续两轮工具调用 → 每轮覆盖上一轮显示,最终只留末轮。"""
     chat = ScriptedChat([
         [
             ChatStreamEvent(kind="content", text="先查时间。"),
@@ -235,6 +237,7 @@ async def test_multiple_tool_rounds_accumulate_all_preamble():
     agent = Agent(chat)
     r = FakeRenderer()
     result = await agent.run([{"role": "user", "content": "x"}], r, ToolDispatcher())
-    assert result.text == "先查时间。再查一下。好了"
-    assert r.final == "先查时间。再查一下。好了"
+    # 覆盖式:只留末轮
+    assert result.text == "好了"
+    assert r.final == "好了"
     assert result.tool_rounds == 2

@@ -30,6 +30,7 @@ async def handle_private(message: Message, user: User, svc: Services) -> None:
     # 回复/引用是用户的强语义信号,显式带进 content,避免模型只看到主消息文本。
     content, query_text = await fold_reply_context(svc, message, content, query_text)
     renderer = DraftRenderer(svc.bot, message.chat.id, svc.limiter,
-                             throttle_ms=svc.settings.edit_throttle_ms)
+                             throttle_ms=svc.settings.edit_throttle_ms,
+                             typing_refresh_s=svc.settings.typing_refresh_s)
     await run_chat_pipeline(svc, user, message, content, renderer,
                             scope="user", query_text=query_text)

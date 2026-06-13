@@ -55,8 +55,9 @@ async def handle_group(message: Message, user: User, svc: Services) -> None:
         query_text = strip_bot_mention(query_text, me.username or "")
 
     renderer = EditRenderer(svc.bot, message.chat.id, svc.limiter,
-                            throttle_ms=svc.settings.edit_throttle_ms,
-                            reply_to_message_id=message.message_id)
+                            throttle_ms=svc.settings.group_edit_throttle_ms,
+                            reply_to_message_id=message.message_id,
+                            typing_refresh_s=svc.settings.typing_refresh_s)
     # 群聊回复上下文同样折叠进 content(避免模型只看到主消息文本)。
     content, query_text = await fold_reply_context(svc, message, content, query_text)
     # 群聊隐私隔离:scope=chat

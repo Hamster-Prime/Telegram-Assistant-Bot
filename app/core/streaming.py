@@ -1,21 +1,35 @@
 """统一流式渲染抽象 —— Draft(私聊)/ Edit(群聊)/ Guest 三路(plan §11)。
 
 - 私聊:sendMessageDraft 原生草稿流 → ~30s 窗口内 sendMessage 定稿
-- 群聊:sendMessage 占位 → 节流 editMessageText → 末次编辑定稿
-- Guest:answerGuestQuery 一次应答入口 → 返回 inline_message_id 上节流编辑
+- 群聊:sendMessage 占位 → 统一轮询循环 editMessageText → 末次编辑定稿
+- Guest:answerGuestQuery 一次应答入口 → 返回 inline_message_id 上轮询编辑
 并发隔离:每个回答独立 draft_id / 占位消息,互不覆盖。
 
-aiogram 3.28 已原生封装 SendMessageDraft / AnswerGuestQuery(Bot API 10.x),
-若运行时 Telegram 服务端不支持(旧 Bot API),自动退化为占位+编辑流。
+aiogram 3.28 已原生封装 SendMessageDraft / AnswerGuestQuery(Bot API 10.x)。
+
+限流约束(Telegram 官方 FAQ,多用户安全):
+- 单聊 sendMessage/editMessageText ≤1 条/秒(短突发可,持续超则 429)
+- 群聊 ≤20 条/分钟 ≈ 3 秒/次
+- 全局合计 ≤~30 条/秒(由 SendRateLimiter 排队消化)
+- sendChatAction typing 状态维持约 5 秒
+- Guest bot 非会话成员,不支持 sendChatAction(仅 answerGuestQuery 通道)
+
+★ 统一轮询门控(Edit/Guest):
+Edit/Guest 渲染器用「单一后台轮询循环」按设定间隔驱动所有编辑 ——
+内容更新与光标闪烁共用同一个间隔,互斥排队。update() 仅暂存最新文本,
+真正发编辑的是循环:每次 tick 若有新内容则更新内容(优先),否则闪烁光标。
+这保证「同一消息任意两次编辑(无论内容或闪烁)间隔 ≥ 设定值」,杜绝多源并发导致 429。
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 import secrets
 from typing import Any, Protocol
 
 from aiogram import Bot
+from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import AnswerGuestQuery, EditMessageMedia, SendMessageDraft
 from aiogram.types import (
@@ -34,6 +48,7 @@ log = get_logger("core.streaming")
 
 TG_MESSAGE_LIMIT = 4096  # Telegram 单消息长度上限
 TG_PARSE_MODE = "HTML"
+_CURSOR = " ▌"  # 输入占位光标
 
 
 def clip(text: str, limit: int = TG_MESSAGE_LIMIT) -> str:
@@ -88,8 +103,6 @@ def _render_for_telegram(text: str) -> str:
 
 
 async def _sleep_retry_after(e: TelegramRetryAfter) -> None:
-    import asyncio
-
     log.warning("Telegram限流,按retry_after退避", 等待秒=e.retry_after)
     await asyncio.sleep(e.retry_after + 0.5)
 
@@ -100,7 +113,104 @@ class StreamRenderer(Protocol):
     async def finalize(self, full_text: str) -> int | None:
         """定稿;返回最终 message_id(可得时)。"""
         ...
+
     async def fail(self, error_text: str) -> None: ...
+
+    @property
+    def last_rendered_text(self) -> str:
+        """最近一次成功渲染(发到 Telegram)的纯文本(不含光标)。
+
+        供 agent 终稿对账:若与 result.text 不一致,说明末次编辑未落地,
+        需强制重发,避免出现「语句截断」(末尾缺字)。
+        """
+        ...
+
+
+# ── 共享助手 ─────────────────────────────────────────────────
+
+
+async def _run_typing_loop(
+    bot: Bot,
+    chat_id: int,
+    limiter: SendRateLimiter,
+    refresh_s: float,
+    stop_event: asyncio.Event,
+) -> None:
+    """周期性发送 typing 状态(status 维持约 5s,按 refresh_s 刷新)。
+
+    typing 丢失对主流程无害(仅无状态显示),故所有异常被吞掉。
+    群聊:bot 是成员,支持;私聊:bot 是对方,支持;
+    Guest:bot 非成员,不支持 → 不应调用本函数。
+    """
+    try:
+        while not stop_event.is_set():
+            try:
+                await limiter.acquire()
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(e.retry_after + 0.3, refresh_s))
+            except Exception as e:
+                log.debug("typing刷新失败(忽略)", 会话=chat_id, 错误=str(e)[:100])
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=refresh_s)
+            except asyncio.TimeoutError:
+                pass
+    except asyncio.CancelledError:
+        raise
+
+
+async def _commit_final_edit(
+    edit_callable: Any,
+    text: str,
+    *,
+    chat_label: Any = None,
+) -> bool:
+    """防弹化的末次编辑 —— 保证完整文本落地,杜绝「语句截断」。
+
+    流程:
+    1. HTML 渲染编辑(传原始文本,由 edit_callable 负责渲染)
+    2. 「message is not modified」→ 文本未变,视为成功
+    3. 其它 TelegramBadRequest(如 "can't parse entities")→ 降级纯文本编辑
+    4. TelegramRetryAfter → 退避重试(上限 3 次)
+    5. 仍失败 → 记 error 但不再抛出(避免冒泡到 errors.py 用「内部错误」覆盖消息)
+
+    edit_callable(text, parse_mode=...) 由调用方提供,封装 chat/inline 差异。
+    返回 True 表示完整文本已成功落地。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            await edit_callable(text, parse_mode=TG_PARSE_MODE)
+            return True
+        except TelegramRetryAfter as e:
+            last_exc = e
+            log.warning("定稿编辑被限流,退避重试", 标识=chat_label,
+                        尝试=attempt + 1, 等待秒=e.retry_after)
+            await asyncio.sleep(e.retry_after + 0.3)
+            continue
+        except TelegramBadRequest as e:
+            msg = str(e)
+            if "message is not modified" in msg:
+                return True
+            if "entities" in msg or "parse" in msg or "tag" in msg:
+                log.warning("定稿HTML解析失败,降级纯文本", 标识=chat_label, 错误=msg[:120])
+                try:
+                    await edit_callable(html.escape(text), parse_mode=None)
+                    return True
+                except TelegramRetryAfter as re_:
+                    last_exc = re_
+                    await asyncio.sleep(re_.retry_after + 0.3)
+                    continue
+                except TelegramBadRequest as e2:
+                    if "message is not modified" in str(e2):
+                        return True
+                    last_exc = e2
+                    continue
+            last_exc = e
+            continue
+    log.error("定稿编辑最终失败(消息可能停留在较短的中间状态)", 标识=chat_label,
+              错误=str(last_exc)[:160] if last_exc else "未知")
+    return False
 
 
 class DraftRenderer:
@@ -108,18 +218,27 @@ class DraftRenderer:
 
     草稿是临时预览(~30s),不自动落地;必须窗口内 sendMessage 定稿。
     Telegram 服务端不支持时自动退化为占位+编辑流。
+
+    typing 策略:首 token 到达前发 typing 填补「无预览」的空白;
+    一旦首个 draft 预览成功发出(draft 自带流式预览),停止 typing 任务。
     """
 
     def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
-                 throttle_ms: int = 1500) -> None:
+                 throttle_ms: int = 1000, *,
+                 typing_refresh_s: float = 4.0) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._limiter = limiter
-        self._draft_id = secrets.randbelow(2**31 - 1) + 1  # 每回答独立 draft_id
+        self._draft_id = secrets.randbelow(2**31 - 1) + 1
         # 草稿更新比编辑廉价,节流间隔取 1/3
         self._throttle = EditThrottle(throttle_ms=max(300, throttle_ms // 3))
         self._draft_supported = True
         self._fallback: EditRenderer | None = None
+        self._typing_refresh_s = typing_refresh_s
+        self._typing_stop: asyncio.Event | None = None
+        self._typing_task: asyncio.Task | None = None
+        self._first_token_sent = False
+        self._last_rendered = ""
 
     async def _send_draft(self, text: str) -> None:
         await self._bot(SendMessageDraft(
@@ -131,6 +250,23 @@ class DraftRenderer:
 
     async def start(self) -> None:
         log.debug("私聊不发送初始占位消息", 会话=self._chat_id, 草稿ID=self._draft_id)
+        # 首 token 前用 typing 填补空白(draft 预览尚未出现)
+        self._typing_stop = asyncio.Event()
+        self._typing_task = asyncio.create_task(
+            _run_typing_loop(self._bot, self._chat_id, self._limiter,
+                             self._typing_refresh_s, self._typing_stop))
+
+    async def _stop_typing(self) -> None:
+        if self._typing_task is not None and not self._typing_task.done():
+            if self._typing_stop is not None:
+                self._typing_stop.set()
+            self._typing_task.cancel()
+            try:
+                await self._typing_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._typing_task = None
+        self._typing_stop = None
 
     async def update(self, full_text: str) -> None:
         if not self._draft_supported:
@@ -143,6 +279,11 @@ class DraftRenderer:
             await self._limiter.acquire()
             await self._send_draft(full_text)
             self._throttle.mark_committed(full_text)
+            self._last_rendered = full_text
+            # 首个 draft 预览已出现:停止 typing(draft 流式预览接管)
+            if not self._first_token_sent:
+                self._first_token_sent = True
+                await self._stop_typing()
         except TelegramRetryAfter as e:
             await _sleep_retry_after(e)
         except Exception as e:
@@ -150,6 +291,7 @@ class DraftRenderer:
                         错误=str(e)[:120])
 
     async def finalize(self, full_text: str) -> int | None:
+        await self._stop_typing()
         text = clip(full_text) or "(空回复)"
         if not self._draft_supported:
             assert self._fallback is not None
@@ -161,6 +303,7 @@ class DraftRenderer:
                     self._chat_id, _render_for_telegram(text),
                     parse_mode=TG_PARSE_MODE,
                 )
+                self._last_rendered = full_text
                 log.info("私聊回复已定稿", 会话=self._chat_id, 消息ID=msg.message_id,
                          长度=len(text))
                 return msg.message_id
@@ -168,6 +311,7 @@ class DraftRenderer:
                 await _sleep_retry_after(e)
 
     async def fail(self, error_text: str) -> None:
+        await self._stop_typing()
         try:
             await self._limiter.acquire()
             await self._bot.send_message(
@@ -177,21 +321,116 @@ class DraftRenderer:
         except Exception as e:
             log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
 
+    @property
+    def last_rendered_text(self) -> str:
+        return self._last_rendered
 
-class EditRenderer:
-    """群聊(成员):sendMessage 占位 → 节流 editMessageText → 末次定稿。"""
+
+class _TickLoopMixin:
+    """统一轮询循环:内容更新与光标闪烁共用同一间隔门控。
+
+    update() 仅暂存 _pending(非阻塞);真正发编辑的是后台 _tick_loop:
+    每个 interval 做 1 次 tick —— 若有新内容则更新内容(优先),否则闪烁光标。
+    这保证「同一消息任意两次编辑间隔 ≥ interval」,杜绝多源并发导致 429。
+    """
+
+    _interval_s: float
+    _stop: asyncio.Event
+    _tick_task: asyncio.Task | None
+    _pending: str | None
+    _committed: str
+    _cursor_on: bool
+
+    def _tick_init(self, interval_s: float) -> None:
+        self._interval_s = interval_s
+        self._stop = asyncio.Event()
+        self._tick_task = None
+        self._pending = None
+        self._committed = ""
+        self._cursor_on = True
+
+    async def _tick_loop(self, do_edit: Any) -> None:
+        """轮询循环:按 interval 驱动内容更新/闪烁。do_edit(text)->awaitable。"""
+        try:
+            while not self._stop.is_set():
+                # 内容更新优先;无新内容时,若已有内容则闪烁
+                if self._pending is not None and self._pending != self._committed:
+                    text = self._pending
+                    self._committed = self._pending
+                    self._on_committed(self._pending)
+                    self._pending = None
+                elif self._committed:
+                    text = self._committed  # 静默 → 闪烁
+                else:
+                    text = None
+                if text is not None:
+                    self._cursor_on = not self._cursor_on
+                    suffix = _CURSOR if self._cursor_on else ""
+                    try:
+                        await do_edit(text + suffix)
+                    except Exception as e:
+                        log.warning("轮询编辑失败(忽略)", 错误=str(e)[:120])
+                # 等到下一个 tick(或停止信号)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+
+    def _on_committed(self, text: str) -> None:
+        """内容提交时的钩子(子类覆盖以记录 last_rendered)。"""
+        pass
+
+    async def _stop_tick(self) -> None:
+        self._stop.set()
+        if self._tick_task is not None and not self._tick_task.done():
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._tick_task = None
+
+
+class EditRenderer(_TickLoopMixin):
+    """群聊(成员):sendMessage 占位 → 统一轮询循环 editMessageText → 末次定稿。
+
+    typing:群聊 bot 是成员,支持 sendChatAction。start 后全程发 typing 直到
+    finalize/fail。光标闪烁由轮询循环在静默期驱动(与内容更新共用间隔)。
+    """
 
     def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
-                 throttle_ms: int = 1500,
+                 throttle_ms: int = 3000,
                  reply_to_message_id: int | None = None,
-                 placeholder: str = "▌") -> None:
+                 placeholder: str = "▌", *,
+                 typing_refresh_s: float = 4.0) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._limiter = limiter
-        self._throttle = EditThrottle(throttle_ms=throttle_ms)
         self._reply_to = reply_to_message_id
         self._placeholder = placeholder
         self._message_id: int | None = None
+        self._typing_refresh_s = typing_refresh_s
+        self._typing_stop: asyncio.Event | None = None
+        self._typing_task: asyncio.Task | None = None
+        self._last_rendered = ""
+        self._tick_init(throttle_ms / 1000)
+
+    def _on_committed(self, text: str) -> None:
+        self._last_rendered = text
+
+    async def _stop_typing(self) -> None:
+        if self._typing_task is not None and not self._typing_task.done():
+            if self._typing_stop is not None:
+                self._typing_stop.set()
+            self._typing_task.cancel()
+            try:
+                await self._typing_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._typing_task = None
+        self._typing_stop = None
 
     async def start(self) -> None:
         while True:
@@ -204,52 +443,77 @@ class EditRenderer:
                 )
                 self._message_id = msg.message_id
                 log.debug("占位消息已发送", 会话=self._chat_id, 消息ID=msg.message_id)
-                return
+                break
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
+        # 群聊:全程 typing 直到 finalize
+        self._typing_stop = asyncio.Event()
+        self._typing_task = asyncio.create_task(
+            _run_typing_loop(self._bot, self._chat_id, self._limiter,
+                             self._typing_refresh_s, self._typing_stop))
+        # 启动统一轮询循环(内容更新 + 闪烁共用间隔)
+        self._tick_task = asyncio.create_task(
+            self._tick_loop(self._do_edit))
 
-    async def _edit(self, text: str) -> None:
-        assert self._message_id is not None
+    async def _do_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+        """单次编辑(供轮询循环与定稿共用)。"""
+        if self._message_id is None:
+            return
+        await self._limiter.acquire()
+        await self._bot.edit_message_text(
+            _render_for_telegram(text) if parse_mode else text,
+            chat_id=self._chat_id,
+            message_id=self._message_id,
+            parse_mode=parse_mode,
+        )
+
+    async def _raw_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+        """带 RetryAfter/BadRequest 处理的编辑(轮询循环用)。"""
         while True:
             try:
-                await self._limiter.acquire()
-                await self._bot.edit_message_text(
-                    _render_for_telegram(text), chat_id=self._chat_id,
-                    message_id=self._message_id,
-                    parse_mode=TG_PARSE_MODE,
-                )
+                await self._do_edit(text, parse_mode=parse_mode)
                 return
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e):
-                    return  # 文本未变化,无须处理
-                raise
+                    return
+                # 其它 BadRequest(如 HTML 解析失败)→ 静默跳过本次(定稿会兜底)
+                log.debug("轮询编辑BadRequest(忽略)", 错误=str(e)[:100])
+                return
 
     async def update(self, full_text: str) -> None:
+        """仅暂存最新文本;真正发编辑的是 _tick_loop。"""
         if self._message_id is None:
             return
-        if not self._throttle.should_commit(full_text):
-            return
-        try:
-            await self._edit(full_text + " ▌")
-            self._throttle.mark_committed(full_text)
-        except Exception as e:
-            log.warning("编辑流更新失败(忽略)", 会话=self._chat_id, 错误=str(e)[:120])
+        self._pending = full_text
 
     async def finalize(self, full_text: str) -> int | None:
+        await self._stop_tick()
+        await self._stop_typing()
         text = full_text.strip() or "(空回复)"
         if self._message_id is None:
             await self.start()
-        await self._edit(text)
+            await self._stop_tick()
+            await self._stop_typing()
+        # 防弹化末次编辑:HTML 失败降级纯文本,保证完整文本落地(杜绝截断)
+        async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
+            await self._do_edit(rendered, parse_mode=parse_mode)
+        ok = await _commit_final_edit(_edit_fn, text, chat_label=self._chat_id)
+        if ok:
+            self._last_rendered = text
         log.info("编辑流回复已定稿", 会话=self._chat_id, 消息ID=self._message_id,
-                 长度=len(text))
+                 长度=len(text), 落地="成功" if ok else "失败")
         return self._message_id
 
     async def fail(self, error_text: str) -> None:
+        await self._stop_tick()
+        await self._stop_typing()
         try:
             if self._message_id is not None:
-                await self._edit(error_text)
+                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
+                    await self._do_edit(rendered, parse_mode=parse_mode)
+                await _commit_final_edit(_edit_fn, error_text, chat_label=self._chat_id)
             else:
                 await self._limiter.acquire()
                 await self._bot.send_message(
@@ -263,28 +527,36 @@ class EditRenderer:
     def message_id(self) -> int | None:
         return self._message_id
 
+    @property
+    def last_rendered_text(self) -> str:
+        return self._last_rendered
 
-class GuestRenderer:
+
+class GuestRenderer(_TickLoopMixin):
     """Guest 模式:answerGuestQuery 一次应答入口(每次召唤仅此一次),
-    返回 SentGuestMessage.inline_message_id,后续在其上节流 editMessageText。
+    返回 SentGuestMessage.inline_message_id,后续在其上统一轮询编辑。
+
+    typing:Guest bot 非会话成员,**不支持** sendChatAction(仅 answerGuestQuery
+    通道)。故用「光标闪烁」作为唯一「工作中」信号 —— 由统一轮询循环在静默期驱动
+    (与内容更新共用间隔)。
     """
 
     def __init__(self, bot: Bot, chat_id: int, guest_query_id: str,
-                 limiter: SendRateLimiter, throttle_ms: int = 1500) -> None:
+                 limiter: SendRateLimiter, throttle_ms: int = 1000) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._guest_query_id = guest_query_id
         self._limiter = limiter
-        self._throttle = EditThrottle(throttle_ms=throttle_ms)
         self._inline_message_id: str | None = None
-        # Guest 单 inline 消息:同步生成的图片/语音暂存于此,finalize 时转为媒体
         self._pending_media: dict[str, Any] | None = None
+        self._last_rendered = ""
+        self._tick_init(throttle_ms / 1000)
+
+    def _on_committed(self, text: str) -> None:
+        self._last_rendered = text
 
     def attach_pending(self, kind: str, url: str, note: str | None) -> None:
-        """暂存一个待投递媒体(图片=photo / 语音=audio)。仅保留首个。
-
-        Guest 仅一条 inline 消息,故多媒体只展示第一个;note 追加到 caption。
-        """
+        """暂存一个待投递媒体(图片=photo / 语音=audio)。仅保留首个。"""
         if self._pending_media is None:
             self._pending_media = {"kind": kind, "url": url, "note": note or ""}
 
@@ -310,40 +582,41 @@ class GuestRenderer:
             log.error("answerGuestQuery失败", 查询ID=self._guest_query_id,
                       错误=str(e)[:200])
             raise
+        # 启动统一轮询循环(内容更新 + 闪烁共用间隔)
+        self._tick_task = asyncio.create_task(
+            self._tick_loop(self._raw_edit))
 
-    async def _edit(self, text: str) -> None:
+    async def _do_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
         if self._inline_message_id is None:
             return
+        await self._limiter.acquire()
+        await self._bot.edit_message_text(
+            _render_for_telegram(text) if parse_mode else text,
+            inline_message_id=self._inline_message_id,
+            parse_mode=parse_mode,
+        )
+
+    async def _raw_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+        """带 RetryAfter/BadRequest 处理的编辑(轮询循环用)。"""
         while True:
             try:
-                await self._limiter.acquire()
-                await self._bot.edit_message_text(
-                    _render_for_telegram(text),
-                    inline_message_id=self._inline_message_id,
-                    parse_mode=TG_PARSE_MODE,
-                )
+                await self._do_edit(text, parse_mode=parse_mode)
                 return
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e):
                     return
-                raise
+                log.debug("Guest轮询编辑BadRequest(忽略)", 错误=str(e)[:100])
+                return
 
     async def update(self, full_text: str) -> None:
+        """仅暂存最新文本;真正发编辑的是 _tick_loop。"""
         if self._inline_message_id is None:
             return
-        if not self._throttle.should_commit(full_text):
-            return
-        try:
-            await self._edit(full_text + " ▌")
-            self._throttle.mark_committed(full_text)
-        except Exception as e:
-            log.warning("Guest编辑更新失败(忽略)", 会话=self._chat_id,
-                        错误=str(e)[:120])
+        self._pending = full_text
 
     async def _edit_media(self, media: Any) -> bool:
-        """把 inline 消息转成媒体(editMessageMedia)。成功返回 True。"""
         if self._inline_message_id is None:
             return False
         try:
@@ -359,8 +632,10 @@ class GuestRenderer:
             return False
 
     async def finalize(self, full_text: str) -> int | None:
+        await self._stop_tick()
         text = (full_text.strip() or "(空回复)")
         pm = self._pending_media
+        ok_final = False
         if pm and self._inline_message_id is not None:
             caption = _render_for_telegram(text)
             note = pm.get("note") or ""
@@ -368,16 +643,24 @@ class GuestRenderer:
                 caption = (caption + "\n" + note)[:TG_MESSAGE_LIMIT]
             kind, url = pm["kind"], pm["url"]
             media = self._build_media(kind, url, caption)
-            ok = await self._edit_media(media)
-            if not ok:
-                # 降级:文本 + 可点击链接(URL 媒体体积超限等情况)
+            ok_final = await self._edit_media(media)
+            if not ok_final:
                 link_line = f"\n\n✅ 已生成:[查看]({url})"
-                await self._edit(text + link_line)
+                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
+                    await self._do_edit(rendered, parse_mode=parse_mode)
+                ok_final = await _commit_final_edit(
+                    _edit_fn, text + link_line, chat_label=self._chat_id)
         else:
-            await self._edit(text)
+            async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
+                await self._do_edit(rendered, parse_mode=parse_mode)
+            ok_final = await _commit_final_edit(_edit_fn, text,
+                                                chat_label=self._chat_id)
+        if ok_final:
+            self._last_rendered = text
         log.info("Guest回复已定稿", 会话=self._chat_id,
                  内联消息ID=self._inline_message_id or "无",
-                 形式=pm["kind"] if pm else "文本", 长度=len(full_text))
+                 形式=pm["kind"] if pm else "文本", 长度=len(full_text),
+                 落地="成功" if ok_final else "失败")
         return None
 
     @staticmethod
@@ -386,12 +669,19 @@ class GuestRenderer:
             return InputMediaPhoto(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
         if kind == "video":
             return InputMediaVideo(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
-        # audio(语音合成):Guest 无 Voice 类型,按 Audio 投递
         return InputMediaAudio(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
 
     async def fail(self, error_text: str) -> None:
+        await self._stop_tick()
         try:
             if self._inline_message_id is not None:
-                await self._edit(error_text)
+                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
+                    await self._do_edit(rendered, parse_mode=parse_mode)
+                await _commit_final_edit(_edit_fn, error_text,
+                                         chat_label=self._chat_id)
         except Exception as e:
             log.error("Guest错误提示发送失败", 会话=self._chat_id, 错误=str(e)[:120])
+
+    @property
+    def last_rendered_text(self) -> str:
+        return self._last_rendered

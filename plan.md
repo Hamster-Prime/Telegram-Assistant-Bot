@@ -443,13 +443,28 @@ token 估算用 `utils/tokens.py`（中文≈1.5 char/token、英文≈4 char/to
 
 ## 11. 流式输出抽象（`streaming.py`）
 
-| 场景 | 首发 | 流式更新 | 定稿 | 要点 |
-|---|---|---|---|---|
-| **私聊** | `sendMessageDraft(chat_id, draft_id, text="")` | 同 `draft_id`、文本递增 | `sendMessage(最终)` | 草稿是**临时预览(~30s)**，不自动落地；必须窗口内 `sendMessage` 定稿。失败无需清理。 |
-| **群聊（成员）** | `sendMessage("▌")` 占位 | 节流 `editMessageText` | 末次 `editMessageText` | 仅 @提及/回复机器人时触发，避免刷屏。 |
-| **Guest 模式** | `answerGuestQuery(guest_query_id, ...)` → `SentGuestMessage` | 对返回消息节流 `editMessageText` | 末次 `editMessageText` | 每次召唤仅一次应答入口，后续靠编辑增量更新。 |
+| 场景 | 首发 | 流式更新 | 定稿 | typing 状态 | 要点 |
+|---|---|---|---|---|---|
+| **私聊** | `sendMessageDraft` | 同 `draft_id`、文本递增 | `sendMessage(最终)` | ✅ 首 token 前发,首字到达后停(draft 预览接管) | 草稿是**临时预览(~30s)**，必须窗口内定稿。 |
+| **群聊（成员）** | `sendMessage("▌")` 占位 | 统一轮询循环 `editMessageText` | 末次 `editMessageText` | ✅ 全程每 4s 刷新(bot 是成员) | 仅 @提及/回复触发。 |
+| **Guest 模式** | `answerGuestQuery` → `SentGuestMessage` | 统一轮询循环 `editMessageText` | 末次 `editMessageText` | ❌ 不支持(bot 非成员,仅 answerGuestQuery 通道) | 用光标闪烁作「工作中」信号。 |
 
-**节流（Edit 路径）**：缓冲增量，满足任一才提交——距上次 ≥`EDIT_THROTTLE_MS(1500)`、新增 ≥80 字符、遇句末标点、或流结束；命中 429 按 `retry_after` 退避；文本未变化不发编辑（防 `message is not modified`）。
+**★ 统一轮询门控（Edit/Guest）**：内容更新与光标闪烁共用同一间隔，由单一后台轮询循环驱动。`update()` 仅暂存最新文本（非阻塞），循环按设定间隔 tick：有新内容则更新内容（优先），否则闪烁光标。这保证「同一消息任意两次编辑（无论内容或闪烁）间隔 ≥ 设定值」，杜绝多源并发导致 429。
+
+**节流间隔（按场景区分贴近 Telegram 硬限）**：
+- 私聊 / Guest inline：`EDIT_THROTTLE_MS(1000)` —— 单聊 ≤1 条/秒
+- 群聊：`GROUP_EDIT_THROTTLE_MS(3000)` —— 群 ≤20 条/分钟 ≈ 3 秒/次
+- 多用户并发由全局 `SendRateLimiter`(28/s) 排队消化（≤~30/s 硬限）。
+
+**typing 状态**（`sendChatAction` "typing"，status 维持约 5s）：
+- 私聊：`start()` 起 typing 任务，首个 draft 预览成功后 cancel。
+- 群聊：`start()` 起 typing 任务，全程每 `TYPING_REFRESH_S(4s)` 刷新，`finalize`/`fail` 时 cancel。
+- Guest：不支持。
+
+**定稿防弹化（杜绝「语句截断」）**：末次编辑经 `_commit_final_edit` —— HTML 解析失败时降级纯文本；429 退避重试(上限 3 次)；全失败仅记 error 不抛出。Agent 终稿后对账 `last_rendered_text`，不一致则强制重发。
+
+**覆盖式渲染**：工具调用后新文本覆盖上一轮显示（不累积前导语），每段在其展示期内完整，最终消息即末轮完整文本。
+
 **并发隔离**：每个流式回答用独立 `draft_id`/占位消息，多个并发回答互不覆盖（见 §4.2）。
 **思考内容**：`reasoning_details` 默认不展示；`settings.show_thinking=true` 时以 `> 引用块` 前置。
 
@@ -624,7 +639,13 @@ HTTPX_MAX_CONNECTIONS=100
 # 行为 / 存储
 DEFAULT_TOKEN_BUDGET=128000
 COMPACT_TRIGGER_RATIO=0.6
-EDIT_THROTTLE_MS=1500
+# 编辑节流(按场景,贴近 Telegram 硬限避免 429):
+#   单聊/Guest inline ≤1 条/秒 → EDIT_THROTTLE_MS=1000
+#   群聊 ≤20 条/分钟 ≈3 秒/次 → GROUP_EDIT_THROTTLE_MS=3000
+EDIT_THROTTLE_MS=1000
+GROUP_EDIT_THROTTLE_MS=3000
+# typing 状态刷新间隔(status 维持约 5 秒)
+TYPING_REFRESH_S=4
 DB_PATH=./data/bot.db
 SQLITE_WAL=1
 LOG_LEVEL=INFO
@@ -655,7 +676,9 @@ LOG_LEVEL=INFO
 - **背压而非拒绝**：并发超限时排队并提示"排队中"，避免直接丢弃用户请求；同时用 `PER_USER_CONCURRENCY` 防单用户饿死他人。
 - **重启恢复**：未决 `generations` 必须在启动时重挂轮询，否则重启丢任务。
 - **草稿 30s 窗口**：私聊流式须在 ~30s 内 `sendMessage` 定稿；长生成用占位真实消息表进度，勿用草稿。
-- **`editMessageText` / 发送限流**：群聊/Guest 必须节流；全局发送走限流器（≈30 msg/s）；命中 429 按 `retry_after` 退避；无变化不发编辑。
+- **`editMessageText` / 发送限流**：群聊/Guest 必须节流（群聊 3s/次、单聊/Guest 1s/次，贴近 Telegram 硬限）；**内容更新与光标闪烁共用同一间隔**（统一轮询循环），杜绝多源编辑超速；全局发送走限流器（≈30 msg/s）；命中 429 按 `retry_after` 退避；无变化不发编辑。
+- **typing 状态**：私聊(首 token 前) / 群聊(全程)支持 sendChatAction；**Guest 不支持**(bot 非成员，仅 answerGuestQuery 通道)，改用光标闪烁作「工作中」信号。
+- **语句截断防护**：末次编辑经防弹化(HTML 降级纯文本 + 退避重试 + 不抛异常)，Agent 终稿后对账 `last_rendered_text`，不一致强制重发，杜绝工具多轮后末尾缺字。
 - **Guest 无历史 / 按召唤者鉴权**：上下文仅靠本次召唤；鉴权用 `guest_bot_caller_user.id`。
 - **搜索回退依赖外部稳定性**：三家全挂给"暂时无法联网"；DDG 在云 IP 可能被封，仅兜底，空结果按失败处理。
 - **临时 URL 24h 失效**：图/视/音频 MiniMax 链接须即时下载转存为 Telegram 文件，勿存裸链。

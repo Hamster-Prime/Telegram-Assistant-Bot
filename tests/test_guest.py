@@ -40,7 +40,8 @@ def make_svc(files: dict[str, tuple[str, bytes, int | None]] | None = None):
         bot=FakeBot(files),
         files_api=FakeFilesAPI(),
         limiter=object(),
-        settings=SimpleNamespace(edit_throttle_ms=1),
+        settings=SimpleNamespace(edit_throttle_ms=1, group_edit_throttle_ms=3,
+                                 typing_refresh_s=4.0),
     )
 
 

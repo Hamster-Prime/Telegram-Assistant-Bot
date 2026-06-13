@@ -47,10 +47,11 @@ class Agent:
         result = AgentResult()
         convo = list(messages)
         tools = tools if tools is not None else TOOL_SCHEMAS
-        # 跨轮累积:工具调用前的前导语(如"好的,我来帮您查询")不能丢失,
-        # 否则工具轮后下一轮文本会覆盖掉它,最终消息只剩末轮文本。
-        # Guest 单 inline 消息 + persist=False 时此问题最明显(首句被截断)。
-        preamble = ""
+        # 覆盖式渲染:每轮工具调用后,新文本覆盖上一轮显示(不累积前导语)。
+        # 用户体验:第1轮"我去搜一下" → 工具执行 → 第2轮覆盖为"查找到..." →
+        # 最终覆盖为完整答案。每段在其展示期内完整(由 finalize 防弹化保证),
+        # 最终消息即末轮完整文本。各轮 assistant 消息仍按真实内容入 convo(供
+        # 模型下一轮看到完整工具调用历史),仅「用户可见的流式显示」是覆盖式。
 
         for round_no in range(1, MAX_TOOL_ROUNDS + 2):
             full_text = ""
@@ -62,10 +63,10 @@ class Agent:
                 async for ev in self._chat.stream_chat(convo, tools=tools):
                     if ev.kind == "content":
                         full_text += ev.text
-                        display = preamble + full_text
+                        display = full_text
                         if show_thinking and reasoning_text:
                             quoted = "\n".join(f"> {ln}" for ln in reasoning_text.splitlines())
-                            display = f"{quoted}\n\n{preamble + full_text}"
+                            display = f"{quoted}\n\n{full_text}"
                         await renderer.update(display)
                     elif ev.kind == "reasoning":
                         reasoning_text += ev.text
@@ -83,12 +84,11 @@ class Agent:
                 )
                 log.error("Agent对话中断", 轮次=round_no, 异常类型=type(e).__name__,
                           已收文本长度=len(full_text), 报错=user_msg)
-                combined = preamble + full_text
-                if combined.strip():
-                    await renderer.finalize(combined + f"\n\n{user_msg}")
+                if full_text.strip():
+                    await renderer.finalize(full_text + f"\n\n{user_msg}")
                 else:
                     await renderer.fail(user_msg)
-                result.text = combined
+                result.text = full_text
                 result.reasoning = reasoning_text
                 return result
 
@@ -97,14 +97,12 @@ class Agent:
             if finish == "tool_calls" and pending_calls:
                 if round_no > MAX_TOOL_ROUNDS:
                     log.warning("工具调用轮次超限,强制收尾", 轮次=round_no)
-                    combined = preamble + (full_text or "")
+                    combined = full_text or ""
                     await renderer.finalize(combined or "(工具调用轮次过多,已中止)")
                     result.text = combined
                     return result
                 result.tool_rounds += 1
-                # 工具调用前的前导语并入 preamble,避免下一轮覆盖丢失
-                preamble += full_text
-                # assistant 消息(含 tool_calls)入会话
+                # assistant 消息(含 tool_calls)入会话 —— 供模型下一轮看到完整工具历史
                 convo.append({
                     "role": "assistant",
                     "content": full_text or None,
@@ -128,18 +126,28 @@ class Agent:
                         "tool_call_id": tc.id or f"call_{i}",
                         "content": tool_result,
                     })
-                continue  # 续写下一轮
+                continue  # 续写下一轮(新 full_text 覆盖上一轮显示)
 
             # 正常结束
-            result.text = preamble + full_text
-            display = preamble + full_text
+            result.text = full_text
+            display = full_text
             if show_thinking and result.reasoning:
                 quoted = "\n".join(f"> {ln}" for ln in result.reasoning.splitlines())
-                display = f"{quoted}\n\n{preamble + full_text}"
+                display = f"{quoted}\n\n{full_text}"
             await renderer.finalize(display or "(空回复)")
+            # 终稿对账:末次编辑可能因限流/HTML错误未落地,消息停在较短中间状态。
+            # 若 renderer 记录的最后渲染文本与最终文本不一致,强制再定稿一次。
+            last_rendered = getattr(renderer, "last_rendered_text", "")
+            reconciled = False
+            if last_rendered and last_rendered != display.strip():
+                log.warning("终稿对账:末次编辑疑似未落地,强制重发",
+                            轮次=round_no, 期望长度=len(display),
+                            实际渲染长度=len(last_rendered))
+                await renderer.finalize(display or "(空回复)")
+                reconciled = True
             log.info("Agent对话完成", 轮次=round_no, 工具轮数=result.tool_rounds,
                      使用工具=result.tools_used or "无", 回复长度=len(full_text),
-                     Token用量=result.total_tokens)
+                     Token用量=result.total_tokens, 终稿对账="重发" if reconciled else "一致")
             return result
 
         result.text = ""
