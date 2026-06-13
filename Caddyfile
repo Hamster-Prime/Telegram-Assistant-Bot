@@ -1,0 +1,4 @@
+# 替换为你的域名;Caddy 自动签发 TLS 证书
+bot.example.com {
+    reverse_proxy bot:8080
+}

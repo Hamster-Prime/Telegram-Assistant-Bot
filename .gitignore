@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# 环境与数据
+.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/cache/
+
+# IDE
+.idea/
+.vscode/
