@@ -20,6 +20,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import BufferedInputFile, URLInputFile
 
 from app.core.concurrency import SendRateLimiter
+from app.core.htmlfmt import sanitize_telegram_html
 from app.logging import get_logger
 
 log = get_logger("core.delivery")
@@ -66,8 +67,11 @@ class DirectDelivery:
     async def send_photo(self, url: str, caption: str | None = None) -> bool:
         try:
             await self._limiter.acquire()
-            await self._bot.send_photo(self._chat_id, URLInputFile(url),
-                                       caption=caption)
+            kwargs: dict[str, Any] = {}
+            if caption:
+                kwargs["caption"] = sanitize_telegram_html(caption)
+                kwargs["parse_mode"] = "HTML"
+            await self._bot.send_photo(self._chat_id, URLInputFile(url), **kwargs)
             return True
         except Exception as e:
             log.warning("图片直发失败", 会话=self._chat_id, 错误=str(e)[:120])
@@ -91,7 +95,8 @@ class DirectDelivery:
         while True:
             try:
                 await self._limiter.acquire()
-                msg = await self._bot.send_message(self._chat_id, text)
+                msg = await self._bot.send_message(
+                    self._chat_id, sanitize_telegram_html(text), parse_mode="HTML")
                 return msg.message_id
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
@@ -102,14 +107,16 @@ class DirectDelivery:
         try:
             await self._limiter.acquire()
             await self._bot.edit_message_text(
-                text, chat_id=self._chat_id, message_id=msg_id)
+                sanitize_telegram_html(text), chat_id=self._chat_id,
+                message_id=msg_id, parse_mode="HTML")
         except Exception as e:
             log.debug("占位编辑失败(忽略)", 会话=self._chat_id, 错误=str(e)[:120])
 
     async def send_text(self, text: str) -> bool:
         try:
             await self._limiter.acquire()
-            await self._bot.send_message(self._chat_id, text)
+            await self._bot.send_message(
+                self._chat_id, sanitize_telegram_html(text), parse_mode="HTML")
             return True
         except Exception as e:
             log.warning("文本直发失败", 会话=self._chat_id, 错误=str(e)[:120])
