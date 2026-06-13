@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject, Update
+from aiogram.types import InlineQuery, Message, TelegramObject, Update
 
 from app.config import Settings
 from app.db.dao import DAOBundle
@@ -24,7 +24,15 @@ def extract_actor(event: TelegramObject) -> tuple[int | None, str | None, str | 
     """从事件中提取判定主体(发起人)的 (id, username, first_name)。
 
     Guest 模式:消息带 guest_query_id 时按 guest_bot_caller_user(召唤者)判定。
+    Inline 模式:按 InlineQuery.from_user 判定。
     """
+    # Inline 模式:InlineQuery 自带 from_user
+    if isinstance(event, InlineQuery):
+        fu = event.from_user
+        if fu is None:
+            return None, None, None
+        return fu.id, getattr(fu, "username", None), getattr(fu, "first_name", None)
+
     msg: Message | None = None
     if isinstance(event, Message):
         msg = event
@@ -69,11 +77,14 @@ class AuthMiddleware(BaseMiddleware):
                         角色=user.role, 授权状态=user.authorized)
             await self._daos.audit.add(actor_id, "denied", None,
                                        f"未授权访问 username={username}")
-            msg = event if isinstance(event, Message) else None
-            if msg is None and isinstance(event, Update):
-                msg = event.message or getattr(event, "guest_message", None)
-            if msg is not None:
-                await self._send_denial(msg)
+            if isinstance(event, InlineQuery):
+                await self._deny_inline(event)
+            else:
+                msg = event if isinstance(event, Message) else None
+                if msg is None and isinstance(event, Update):
+                    msg = event.message or getattr(event, "guest_message", None)
+                if msg is not None:
+                    await self._send_denial(msg)
             return None  # 终止链路(aiogram3:返回而不调用 handler 即取消)
 
         log.debug("鉴权通过", 用户=actor_id, 角色=user.role)
@@ -105,6 +116,25 @@ class AuthMiddleware(BaseMiddleware):
                 await msg.answer(self._settings.permission_denied_text)
         except Exception as e:
             log.warning("发送拒绝提示失败", 错误=str(e)[:120])
+
+    async def _deny_inline(self, query: InlineQuery) -> None:
+        """Inline 模式未授权:返回一条"未授权"提示结果(inline 无法发普通文本)。"""
+        from aiogram.types import (
+            InlineQueryResultArticle,
+            InputTextMessageContent,
+        )
+        try:
+            await query.answer(
+                [InlineQueryResultArticle(
+                    id="denied",
+                    title="⛔ Permission Denied",
+                    input_message_content=InputTextMessageContent(
+                        message_text=self._settings.permission_denied_text),
+                )],
+                cache_time=300,
+            )
+        except Exception as e:
+            log.warning("Inline拒绝提示发送失败", 错误=str(e)[:120])
 
 
 def require_role(user: User, *roles: str) -> bool:

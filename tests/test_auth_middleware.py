@@ -33,6 +33,14 @@ def make_guest_message(caller_id: int) -> Message:
     })
 
 
+def make_inline_query(uid: int, query: str = "你好") -> "InlineQuery":
+    from aiogram.types import InlineQuery
+    return InlineQuery.model_validate({
+        "id": "iq-1", "query": query, "offset": "",
+        "from_user": {"id": uid, "is_bot": False, "first_name": "I", "username": f"i{uid}"},
+    })
+
+
 def test_extract_actor_private():
     msg = make_message(42)
     actor_id, username, first = extract_actor(msg)
@@ -137,3 +145,35 @@ async def test_middleware_guest_caller_denied(daos, settings):
     result = await mw(handler, msg, {})
     assert result is None
     handler.assert_not_awaited()
+
+
+def test_extract_actor_inline_query():
+    """Inline 模式按 InlineQuery.from_user 判定发起人。"""
+    iq = make_inline_query(55, "查天气")
+    actor_id, username, _ = extract_actor(iq)
+    assert actor_id == 55 and username == "i55"
+
+
+async def test_middleware_inline_authorized_passes(daos, settings):
+    """授权用户的 inline_query 通过门控并注入 user。"""
+    mw = AuthMiddleware(daos, settings)
+    await daos.users.upsert_basic(55, "i55", "I")
+    await daos.users.set_authorized(55, True, by=999)
+    iq = make_inline_query(55, "你好")
+    handler = AsyncMock(return_value="INLINE_OK")
+    data: dict = {}
+    result = await mw(handler, iq, data)
+    assert result == "INLINE_OK"
+    assert data["user"].tg_id == 55
+
+
+async def test_middleware_inline_denied_answers_query(daos, settings):
+    """未授权用户的 inline_query 被拦截并返回"未授权"结果,handler 不执行。"""
+    mw = AuthMiddleware(daos, settings)
+    iq = make_inline_query(66, "你好")
+    handler = AsyncMock()
+    mw._deny_inline = AsyncMock()
+    result = await mw(handler, iq, {})
+    assert result is None
+    handler.assert_not_awaited()
+    mw._deny_inline.assert_awaited_once()

@@ -10,31 +10,35 @@ from aiogram.client.default import DefaultBotProperties
 
 from app.config import get_settings
 from app.core.auth import AuthMiddleware
-from app.handlers import commands, errors, group, guest, private
+from app.handlers import commands, errors, group, guest, inline, private
 from app.logging import get_logger, setup_logging
 from app.server import build_app
 from app.services import Services
 
 log = get_logger("main")
 
-ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "guest_message"]
+ALLOWED_UPDATES = [
+    "message", "edited_message", "callback_query", "guest_message", "inline_query",
+]
 
 
 def build_dispatcher(svc: Services) -> Dispatcher:
     dp = Dispatcher()
     dp["svc"] = svc
 
-    # 鉴权中间件:message 与 guest_message 都过授权门控
+    # 鉴权中间件:message / guest_message / inline_query 都过授权门控
     auth = AuthMiddleware(svc.daos, svc.settings)
     dp.message.middleware(auth)
     dp.guest_message.middleware(auth)
+    dp.inline_query.middleware(auth)
 
-    # 路由顺序:错误兜底 → 命令 → 三场景
+    # 路由顺序:错误兜底 → 命令 → 三场景 → inline
     dp.include_router(errors.router)
     dp.include_router(commands.router)
     dp.include_router(private.router)
     dp.include_router(group.router)
     dp.include_router(guest.router)
+    dp.include_router(inline.router)
     return dp
 
 
@@ -57,6 +61,25 @@ async def run() -> None:
     svc = Services(settings, bot)
     await svc.startup()
     dp = build_dispatcher(svc)
+
+    # Guest 模式自检:未在 BotFather MiniApp 开启时告警(Guest 召唤将不可用)
+    try:
+        me = await bot.get_me()
+        if not getattr(me, "supports_guest_queries", False):
+            log.warning("Guest Mode 未在 BotFather 开启,任意聊天 @ 召唤将不可用"
+                        "(请在 t.me/Botfather?startapp 里开启 Guest Mode)")
+        if not getattr(me, "supports_inline_queries", False):
+            log.warning("Inline Mode 未开启,输入 @ 看不到本 Bot"
+                        "(请给 @BotFather 发 /setinline 开启)")
+    except Exception as e:
+        log.warning("getMe 自检失败(忽略)", 错误=str(e)[:120])
+
+    # 注册分级命令菜单(中文标注)+ bot 描述;失败不中断启动
+    from app.handlers.commands_registry import register_commands
+    try:
+        await register_commands(bot, svc.daos, settings.superadmin_id_list)
+    except Exception as e:
+        log.warning("命令菜单注册整体失败(忽略)", 错误=str(e)[:160])
 
     try:
         if settings.mode == "webhook":

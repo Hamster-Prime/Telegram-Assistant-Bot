@@ -168,3 +168,73 @@ async def test_show_thinking_renders_quote():
                     show_thinking=True)
     assert r.final.startswith("> 思考中")
     assert "答案" in r.final
+
+
+async def test_preamble_preserved_across_tool_round():
+    """工具调用前的前导语(如"好的,我来帮您查询")不能在工具轮后丢失。
+
+    回归:此前每轮 full_text 重置,工具轮前导语被丢弃,最终只剩末轮文本,
+    在 Guest 单 inline 消息 + persist=False 下表现为首句被截断。
+    """
+    chat = ScriptedChat([
+        [  # 第一轮:先说前导语,再发起工具调用
+            ChatStreamEvent(kind="content", text="好的,我来帮您查询。"),
+            ChatStreamEvent(kind="tool_calls", finish_reason="tool_calls",
+                            tool_calls=[ToolCallDelta(id="c1", name="get_current_time",
+                                                      arguments="{}")]),
+            ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [  # 第二轮:基于工具结果回答
+            ChatStreamEvent(kind="content", text="现在是白天"),
+            ChatStreamEvent(kind="usage", total_tokens=10),
+            ChatStreamEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    agent = Agent(chat)
+    r = FakeRenderer()
+    result = await agent.run([{"role": "user", "content": "几点了"}], r,
+                             ToolDispatcher())
+
+    # 前导语必须保留在最终结果里
+    assert "好的,我来帮您查询。" in result.text
+    assert "现在是白天" in result.text
+    # 定稿文本同样保留前导语
+    assert r.final is not None
+    assert "好的,我来帮您查询。" in r.final
+    assert "现在是白天" in r.final
+    # 流式更新里也应该出现前导语
+    assert any("好的,我来帮您查询。" in u for u in r.updates)
+    # 入会话的 assistant 消息 content 仍是本轮原始前导语(不含续写)
+    second = chat.seen_messages[1]
+    assistant = next(m for m in second if m["role"] == "assistant")
+    assert assistant["content"] == "好的,我来帮您查询。"
+
+
+async def test_multiple_tool_rounds_accumulate_all_preamble():
+    """连续两轮工具调用 → 两轮前导语都保留 + 末轮回答。"""
+    chat = ScriptedChat([
+        [
+            ChatStreamEvent(kind="content", text="先查时间。"),
+            ChatStreamEvent(kind="tool_calls", finish_reason="tool_calls",
+                            tool_calls=[ToolCallDelta(id="c1", name="get_current_time",
+                                                      arguments="{}")]),
+            ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            ChatStreamEvent(kind="content", text="再查一下。"),
+            ChatStreamEvent(kind="tool_calls", finish_reason="tool_calls",
+                            tool_calls=[ToolCallDelta(id="c2", name="get_current_time",
+                                                      arguments="{}")]),
+            ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [
+            ChatStreamEvent(kind="content", text="好了"),
+            ChatStreamEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    agent = Agent(chat)
+    r = FakeRenderer()
+    result = await agent.run([{"role": "user", "content": "x"}], r, ToolDispatcher())
+    assert result.text == "先查时间。再查一下。好了"
+    assert r.final == "先查时间。再查一下。好了"
+    assert result.tool_rounds == 2

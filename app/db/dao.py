@@ -73,6 +73,13 @@ class UserDAO:
         )
         return [r["tg_id"] for r in rows]
 
+    async def list_staff(self) -> list[User]:
+        """返回所有管理员与超级管理员(用于命令菜单分级注册)。"""
+        rows = await self.db.fetch_all(
+            "SELECT * FROM users WHERE role IN ('admin','superadmin') ORDER BY tg_id"
+        )
+        return [User(**dict(r)) for r in rows]
+
     async def count(self) -> int:
         row = await self.db.fetch_one("SELECT COUNT(*) AS c FROM users")
         return row["c"] if row else 0

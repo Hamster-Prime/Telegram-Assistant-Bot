@@ -9,6 +9,7 @@ from aiogram.types import Message
 
 from app.core.auth import require_role
 from app.db.models import User
+from app.handlers.commands_registry import build_help_text
 from app.logging import get_logger
 from app.services import Services
 
@@ -16,17 +17,7 @@ log = get_logger("handlers.commands")
 
 router = Router(name="commands")
 
-HELP_TEXT = """🤖 助理机器人
-
-【对话】直接发消息即可;支持文本/图片/视频/文档
-【生成】/image 描述 · /video 描述 · /tts 文本 · /music 描述
-【联网】/search 关键词 · /fetch 网址
-【记忆】/remember 内容 · /memories · /forget 编号
-【会话】/reset 清空当前会话上下文
-【账户】/whoami 查看身份 · /quota 查看配额
-
-管理员:/grant /revoke /setquota /resetquota /quotas /users /stats
-超管:/promote /demote /broadcast /audit"""
+HELP_TEXT = build_help_text()
 
 
 def _parse_target_id(message: Message, command: CommandObject) -> int | None:
@@ -175,6 +166,11 @@ async def cmd_grant(message: Message, command: CommandObject, user: User,
     await svc.daos.users.set_authorized(target, True, by=user.tg_id)
     await svc.quota.ensure_default(target)
     await svc.daos.audit.add(user.tg_id, "grant", target, "授权用户")
+    # 刷新该用户私聊命令菜单(若已是 admin/superadmin 则反映对应级别)
+    target_user = await svc.daos.users.get(target)
+    if target_user is not None and target_user.role in ("admin", "superadmin"):
+        from app.handlers.commands_registry import refresh_user_commands
+        await refresh_user_commands(svc.bot, target, target_user.role)
     await message.answer(f"✅ 已授权用户 {target}(套用默认配额)")
 
 
@@ -193,6 +189,9 @@ async def cmd_revoke(message: Message, command: CommandObject, user: User,
         return
     await svc.daos.users.set_authorized(target, False, by=user.tg_id)
     await svc.daos.audit.add(user.tg_id, "revoke", target, "撤销授权")
+    # 撤权后该用户降为普通菜单(若曾有 admin 命令,现在不再显示)
+    from app.handlers.commands_registry import refresh_user_commands
+    await refresh_user_commands(svc.bot, target, "user")
     await message.answer(f"🚫 已撤销用户 {target} 的授权")
 
 
@@ -312,6 +311,8 @@ async def cmd_promote(message: Message, command: CommandObject, user: User,
     await svc.daos.users.set_role(target, "admin")
     await svc.daos.users.set_authorized(target, True, by=user.tg_id)
     await svc.daos.audit.add(user.tg_id, "promote", target, "提升为管理员")
+    from app.handlers.commands_registry import refresh_user_commands
+    await refresh_user_commands(svc.bot, target, "admin")
     await message.answer(f"🛡 已提升用户 {target} 为管理员")
 
 
@@ -330,6 +331,8 @@ async def cmd_demote(message: Message, command: CommandObject, user: User,
         return
     await svc.daos.users.set_role(target, "user")
     await svc.daos.audit.add(user.tg_id, "demote", target, "降级为普通用户")
+    from app.handlers.commands_registry import refresh_user_commands
+    await refresh_user_commands(svc.bot, target, "user")
     await message.answer(f"⬇️ 已将用户 {target} 降级为普通用户")
 
 
