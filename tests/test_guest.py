@@ -607,3 +607,67 @@ async def test_guest_ignores_video_from_external_reply(monkeypatch):
     assert captured["content"] == "描述一下"
     assert captured["query_text"] == "描述一下"
     assert svc.bot.downloaded_file_ids == []
+
+
+# ── Guest 命令分流(修复项 3)──────────────────────────────────
+async def test_guest_split_command_parses_cmd_and_args():
+    from app.handlers import guest_commands
+    assert guest_commands._split_command("/reset") == ("reset", "")
+    assert guest_commands._split_command("/reset@my_bot") == ("reset", "")
+    assert guest_commands._split_command("/remember 记住这个") == ("remember", "记住这个")
+    assert guest_commands._split_command("普通消息") == ("", "")
+
+
+async def test_guest_command_help_returns_help_text():
+    from app.handlers import guest_commands
+    result = await guest_commands.execute_guest_command(
+        make_svc(), User(tg_id=77, first_name="C"),
+        make_guest_message("/help"))
+    assert result is not None
+    assert "助理机器人" in result
+
+
+async def test_guest_command_start_greeting():
+    from app.handlers import guest_commands
+    result = await guest_commands.execute_guest_command(
+        make_svc(), User(tg_id=77, first_name="小明"),
+        make_guest_message("/start"))
+    assert result is not None
+    assert "小明" in result
+
+
+async def test_guest_unknown_command_returns_none():
+    """未知命令返回 None,调用方应落入 AI 流程(自然语言处理)。"""
+    from app.handlers import guest_commands
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("/unknowncmd 参数")
+    result = await guest_commands.execute_guest_command(svc, user, message)
+    assert result is None
+
+
+async def test_guest_non_command_returns_none():
+    """非斜杠消息不是命令,返回 None。"""
+    from app.handlers import guest_commands
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("帮我画一只猫")
+    result = await guest_commands.execute_guest_command(svc, user, message)
+    assert result is None
+
+
+async def test_guest_reset_command_uses_logic(monkeypatch):
+    """/reset 走 logic_reset,不再落入 AI。"""
+    from app.handlers import guest_commands
+    called = {"reset": False}
+
+    async def fake_reset(svc, user, chat_id):
+        called["reset"] = True
+        return "🧹 已清空"
+
+    monkeypatch.setattr(guest_commands, "logic_reset", fake_reset)
+    result = await guest_commands.execute_guest_command(
+        make_svc(), User(tg_id=77, first_name="C"),
+        make_guest_message("/reset"))
+    assert called["reset"] is True
+    assert result == "🧹 已清空"

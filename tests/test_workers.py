@@ -20,6 +20,17 @@ class FakeBot:
         self.audios: list = []
         self.messages: list = []
         self.edits: list = []
+        self.inline_media_calls: list = []  # EditMessageMedia(inline) 调用
+        self.inline_text_edits: list = []
+
+    async def __call__(self, method):
+        # Guest inline 回填路径:bot(EditMessageMedia(inline_message_id=...))
+        from aiogram.methods import EditMessageMedia
+        if isinstance(method, EditMessageMedia):
+            self.inline_media_calls.append(method)
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True)
+        return None
 
     async def send_video(self, chat_id, video, caption=None, **kw):
         self.videos.append((chat_id, caption))
@@ -33,8 +44,12 @@ class FakeBot:
         class M: message_id = 555
         return M()
 
-    async def edit_message_text(self, text, chat_id=None, message_id=None, **kw):
-        self.edits.append((chat_id, message_id, text))
+    async def edit_message_text(self, text, chat_id=None, message_id=None,
+                                inline_message_id=None, **kw):
+        if inline_message_id:
+            self.inline_text_edits.append((inline_message_id, text))
+        else:
+            self.edits.append((chat_id, message_id, text))
 
 
 class FakeVideoAPI:
@@ -56,7 +71,12 @@ class FakeVideoAPI:
 class FakeMusicAPI:
     _model = "music-2.6"
 
+    def __init__(self):
+        self.url_mode = False  # True 时返回 (None, url)
+
     async def generate(self, prompt, *, lyrics=None, is_instrumental=False):
+        if self.url_mode:
+            return None, "https://cdn.test/music.mp3"
         return b"FAKE_MP3", None
 
 
@@ -178,3 +198,44 @@ async def test_recover_music_fails_gracefully(env):
     pend = await daos.generations.pending()
     assert pend == []
     assert any("中断" in m[1] for m in bot.messages)
+
+
+# ── Guest inline 回填(修复项)──────────────────────────────────
+async def test_video_guest_inline_backfill(env):
+    """Guest 视频:有 inline_message_id → editMessageMedia 回填,不发 sendVideo。"""
+    pool, daos, bot, user, registry = env
+    gen_id, task_id = await pool.submit_video(
+        user, 100, "海浪", placeholder_msg_id=None,
+        inline_message_id="guest-inline-1")
+    # 等后台轮询完成
+    for _ in range(200):
+        gen = await daos.generations.get(gen_id)
+        if gen.status == "success":
+            break
+        await asyncio.sleep(0.02)
+    assert gen.status == "success"
+    assert gen.inline_message_id == "guest-inline-1"
+    assert bot.videos == []  # 不走直发
+    assert len(bot.inline_media_calls) == 1
+    from aiogram.types import InputMediaVideo
+    assert isinstance(bot.inline_media_calls[0].media, InputMediaVideo)
+    assert bot.inline_media_calls[0].inline_message_id == "guest-inline-1"
+
+
+async def test_music_guest_inline_backfill(env):
+    """Guest 音乐:有 inline_message_id + URL → editMessageMedia 回填。"""
+    pool, daos, bot, user, _ = env
+    pool._music.url_mode = True  # 返回 URL(Guest 必须 URL)
+    gen_id = await pool.submit_music(
+        user, 200, "钢琴曲", is_instrumental=True,
+        inline_message_id="guest-inline-2")
+    for _ in range(100):
+        gen = await daos.generations.get(gen_id)
+        if gen.status == "success":
+            break
+        await asyncio.sleep(0.02)
+    assert gen.status == "success"
+    assert bot.audios == []  # 不走直发
+    assert len(bot.inline_media_calls) == 1
+    from aiogram.types import InputMediaAudio
+    assert isinstance(bot.inline_media_calls[0].media, InputMediaAudio)

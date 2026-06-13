@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from aiogram.types import BufferedInputFile, Message, URLInputFile
+from aiogram.types import Message
 
-from app.core.streaming import StreamRenderer
+from app.core.delivery import DirectDelivery, GuestDelivery, MediaDelivery
+from app.core.streaming import GuestRenderer, StreamRenderer
 from app.core.tools import ToolDispatcher
 from app.db.models import User
 from app.logging import get_logger
@@ -17,9 +18,16 @@ from app.utils.tokens import estimate_tokens
 log = get_logger("handlers.pipeline")
 
 
-def build_dispatcher(svc: Services, user: User, chat_id: int, scope: str,
-                     scope_owner: int) -> ToolDispatcher:
-    """构造绑定了 user/chat 上下文的工具分发表。"""
+def build_dispatcher(
+    svc: Services, user: User, chat_id: int, scope: str, scope_owner: int,
+    delivery: MediaDelivery | None = None,
+) -> ToolDispatcher:
+    """构造绑定了 user/chat 上下文的工具分发表。
+
+    delivery 决定媒体投递方式:None/Direct=直发(私聊/群聊);Guest=暂存到 renderer。
+    """
+    if delivery is None:
+        delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
     d = ToolDispatcher()
 
     async def generate_image(args: dict[str, Any]) -> str:
@@ -33,14 +41,23 @@ def build_dispatcher(svc: Services, user: User, chat_id: int, scope: str,
         )
         if not urls:
             return "图片生成失败:未返回图片"
+        total = len(urls)
         sent = 0
-        for u in urls:
-            try:
-                await svc.limiter.acquire()
-                await svc.bot.send_photo(chat_id, URLInputFile(u))
-                sent += 1
-            except Exception as e:
-                log.warning("图片发送失败", 会话=chat_id, 错误=str(e)[:120])
+        for i, u in enumerate(urls):
+            if delivery.is_guest:
+                # Guest 单 inline 消息:仅首张作为媒体,其余不展示(在 note 注明)
+                if i == 0:
+                    note = (f"\n\n⚠️ 共生成 {total} 张,Guest 模式仅展示首张。"
+                            if total > 1 else "")
+                    ok = await delivery.send_photo(u, note)
+                    if ok:
+                        sent += 1
+                else:
+                    sent += 1  # 计数但不投递
+            else:
+                ok = await delivery.send_photo(u)
+                if ok:
+                    sent += 1
         await svc.quota.settle(user, "calls", svc.quota.call_weight("image"),
                                chat_id=chat_id, kind="image")
         return f"已生成并发送 {sent} 张图片。"
@@ -49,16 +66,23 @@ def build_dispatcher(svc: Services, user: User, chat_id: int, scope: str,
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("video"))
         if not check.ok:
             return check.denial_text()
-        await svc.limiter.acquire()
-        ph = await svc.bot.send_message(chat_id, "🎬 视频生成中,完成后会发到这里…")
+        if delivery.is_guest:
+            # Guest 单 inline 消息:不发占位,worker 完成时 editMessageMedia 回填
+            ph_msg_id = None
+            inline_id = delivery.inline_message_id
+        else:
+            ph_msg_id = await delivery.send_placeholder(
+                "🎬 视频生成中,完成后会发到这里…")
+            inline_id = None
         gen_id, task_id = await svc.workers.submit_video(
             user, chat_id, args["prompt"],
             duration=int(args.get("duration", 6)),
             resolution=args.get("resolution", "768P"),
-            placeholder_msg_id=ph.message_id,
+            placeholder_msg_id=ph_msg_id,
+            inline_message_id=inline_id,
         )
-        return (f"视频生成任务已入队(任务ID {task_id}),正在后台生成,"
-                f"完成后会自动发送给用户。请告知用户可以继续聊其他话题。")
+        return ("视频生成任务已入队,正在后台生成,完成后会自动发送给用户。"
+                "请告知用户可以继续聊其他话题。")
 
     async def synthesize_speech(args: dict[str, Any]) -> str:
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("tts"))
@@ -69,16 +93,11 @@ def build_dispatcher(svc: Services, user: User, chat_id: int, scope: str,
             voice_id=args.get("voice_id", "male-qn-qingse"),
             emotion=args.get("emotion"),
         )
-        await svc.limiter.acquire()
-        if audio_bytes:
-            await svc.bot.send_voice(
-                chat_id, BufferedInputFile(audio_bytes, filename="speech.mp3"))
-        elif audio_url:
-            data = await svc.files_api.download(audio_url)
-            await svc.bot.send_voice(
-                chat_id, BufferedInputFile(data, filename="speech.mp3"))
-        else:
+        if not audio_url and not audio_bytes:
             return "语音合成失败:无音频返回"
+        ok = await delivery.send_voice(audio_url, audio_bytes)
+        if not ok:
+            return "语音已合成,但当前场景(Guest 模式)无法投递,请到私聊使用。"
         await svc.quota.settle(user, "calls", svc.quota.call_weight("tts"),
                                chat_id=chat_id, kind="tts")
         return f"语音已发送(时长 {dur_ms / 1000:.1f} 秒)。"
@@ -87,13 +106,19 @@ def build_dispatcher(svc: Services, user: User, chat_id: int, scope: str,
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("music"))
         if not check.ok:
             return check.denial_text()
-        await svc.limiter.acquire()
-        ph = await svc.bot.send_message(chat_id, "🎵 音乐生成中,完成后会发到这里…")
+        if delivery.is_guest:
+            ph_msg_id = None
+            inline_id = delivery.inline_message_id
+        else:
+            ph_msg_id = await delivery.send_placeholder(
+                "🎵 音乐生成中,完成后会发到这里…")
+            inline_id = None
         await svc.workers.submit_music(
             user, chat_id, args["prompt"],
             lyrics=args.get("lyrics"),
             is_instrumental=bool(args.get("is_instrumental", False)),
-            placeholder_msg_id=ph.message_id,
+            placeholder_msg_id=ph_msg_id,
+            inline_message_id=inline_id,
         )
         return ("音乐生成任务已入队,正在后台生成,完成后会自动发送给用户。"
                 "请告知用户可以继续聊其他话题。")
@@ -188,7 +213,12 @@ async def run_chat_pipeline(
         except Exception:
             pass
 
-        dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner)
+        # renderer.start() 已就位:Guest 的 inline_message_id 此时可取 → 决定投递方式
+        if isinstance(renderer, GuestRenderer):
+            delivery: MediaDelivery = GuestDelivery(renderer)
+        else:
+            delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
+        dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner, delivery)
         result = await svc.agent.run(messages, renderer, dispatcher,
                                      show_thinking=show_thinking)
 

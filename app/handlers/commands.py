@@ -42,39 +42,93 @@ def _parse_target_id(message: Message, command: CommandObject) -> int | None:
     return None
 
 
+def _split_command(text: str) -> tuple[str, str]:
+    """从 '/cmd@bot args...' 解析出 (cmd_lower, args)。非命令返回 ('', '')。"""
+    if not text.startswith("/"):
+        return "", ""
+    parts = text.split(None, 1)
+    head = parts[0].lstrip("/")
+    # 去掉 @bot 后缀
+    cmd = head.split("@", 1)[0].lower()
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return cmd, args
+
+
+# ── 纯逻辑(返回应答文本,供 message handler 与 guest 共用) ──────
+async def logic_start(svc: Services, user: User) -> str:
+    return f"你好,{user.first_name or '朋友'}!我是助理机器人。\n{HELP_TEXT}"
+
+
+async def logic_help() -> str:
+    return HELP_TEXT
+
+
+async def logic_whoami(svc: Services, user: User) -> str:
+    role_zh = {"superadmin": "超级管理员", "admin": "管理员", "user": "用户"}[user.role]
+    quota_text = await svc.quota.status_text(user)
+    return (f"🪪 你的信息\nID:{user.tg_id}\n角色:{role_zh}\n"
+            f"授权:{'✅ 已授权' if user.is_allowed else '⛔ 未授权'}\n{quota_text}")
+
+
+async def logic_reset(svc: Services, user: User, chat_id: int) -> str:
+    async with svc.user_lock.for_user(user.tg_id):
+        await svc.daos.messages.clear_chat(chat_id)
+    log.info("会话已重置", 用户=user.tg_id, 会话=chat_id)
+    return "🧹 当前会话上下文已清空(长期记忆保留)"
+
+
+async def logic_quota(svc: Services, user: User) -> str:
+    return "📊 " + await svc.quota.status_text(user)
+
+
+async def logic_remember(svc: Services, user: User, scope: str, owner: int,
+                         args: str) -> str:
+    if not args:
+        return "用法:/remember 要记住的内容"
+    mem_id = await svc.memory.remember(scope, owner, args)
+    return f"🧠 已记住(编号 {mem_id})"
+
+
+async def logic_memories(svc: Services, user: User, scope: str, owner: int) -> str:
+    mems = await svc.daos.memories.list_all(scope, owner, limit=30)
+    if not mems:
+        return "🧠 暂无长期记忆"
+    lines = [f"{m.id}. {m.text[:80]}({m.source})" for m in mems]
+    return "🧠 长期记忆:\n" + "\n".join(lines)
+
+
+async def logic_forget(svc: Services, user: User, scope: str, owner: int,
+                       args: str) -> str:
+    if not args or not args.strip().isdigit():
+        return "用法:/forget 记忆编号"
+    ok = await svc.daos.memories.delete(int(args.strip()), scope, owner)
+    return "🗑 已删除" if ok else "未找到该记忆(只能删除自己范围内的)"
+
+
 # ── 基础命令 ───────────────────────────────────────────────────
 @router.message(Command("start"))
 async def cmd_start(message: Message, user: User, svc: Services) -> None:
-    await message.answer(
-        f"你好,{user.first_name or '朋友'}!我是助理机器人。\n{HELP_TEXT}")
+    await message.answer(await logic_start(svc, user))
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await message.answer(await logic_help())
 
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message, user: User, svc: Services) -> None:
-    role_zh = {"superadmin": "超级管理员", "admin": "管理员", "user": "用户"}[user.role]
-    quota_text = await svc.quota.status_text(user)
-    await message.answer(
-        f"🪪 你的信息\nID:{user.tg_id}\n角色:{role_zh}\n"
-        f"授权:{'✅ 已授权' if user.is_allowed else '⛔ 未授权'}\n{quota_text}")
+    await message.answer(await logic_whoami(svc, user))
 
 
 @router.message(Command("reset"))
 async def cmd_reset(message: Message, user: User, svc: Services) -> None:
-    # 按用户锁串行化,防与正在写库的对话竞态
-    async with svc.user_lock.for_user(user.tg_id):
-        await svc.daos.messages.clear_chat(message.chat.id)
-    await message.answer("🧹 当前会话上下文已清空(长期记忆保留)")
-    log.info("会话已重置", 用户=user.tg_id, 会话=message.chat.id)
+    await message.answer(await logic_reset(svc, user, message.chat.id))
 
 
 @router.message(Command("quota"))
 async def cmd_quota(message: Message, user: User, svc: Services) -> None:
-    await message.answer("📊 " + await svc.quota.status_text(user))
+    await message.answer(await logic_quota(svc, user))
 
 
 # ── 记忆命令 ───────────────────────────────────────────────────
@@ -87,34 +141,23 @@ def _scope_of(message: Message, user: User) -> tuple[str, int]:
 @router.message(Command("remember"))
 async def cmd_remember(message: Message, command: CommandObject, user: User,
                        svc: Services) -> None:
-    if not command.args:
-        await message.answer("用法:/remember 要记住的内容")
-        return
     scope, owner = _scope_of(message, user)
-    mem_id = await svc.memory.remember(scope, owner, command.args)
-    await message.answer(f"🧠 已记住(编号 {mem_id})")
+    await message.answer(await logic_remember(svc, user, scope, owner,
+                                              command.args or ""))
 
 
 @router.message(Command("memories"))
 async def cmd_memories(message: Message, user: User, svc: Services) -> None:
     scope, owner = _scope_of(message, user)
-    mems = await svc.daos.memories.list_all(scope, owner, limit=30)
-    if not mems:
-        await message.answer("🧠 暂无长期记忆")
-        return
-    lines = [f"{m.id}. {m.text[:80]}({m.source})" for m in mems]
-    await message.answer("🧠 长期记忆:\n" + "\n".join(lines))
+    await message.answer(await logic_memories(svc, user, scope, owner))
 
 
 @router.message(Command("forget"))
 async def cmd_forget(message: Message, command: CommandObject, user: User,
                      svc: Services) -> None:
-    if not command.args or not command.args.strip().isdigit():
-        await message.answer("用法:/forget 记忆编号")
-        return
     scope, owner = _scope_of(message, user)
-    ok = await svc.daos.memories.delete(int(command.args.strip()), scope, owner)
-    await message.answer("🗑 已删除" if ok else "未找到该记忆(只能删除自己范围内的)")
+    await message.answer(await logic_forget(svc, user, scope, owner,
+                                            command.args or ""))
 
 
 # ── 管理命令(admin+) ─────────────────────────────────────────

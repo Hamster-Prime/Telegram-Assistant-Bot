@@ -80,7 +80,9 @@ CREATE TABLE IF NOT EXISTS generations (
   user_id INTEGER, chat_id INTEGER, kind TEXT, model TEXT, prompt TEXT,
   status TEXT,                                    -- queued|processing|success|failed
   task_id TEXT, file_id TEXT, result_url TEXT,
-  placeholder_msg_id INTEGER, error TEXT, created_at INTEGER, finished_at INTEGER
+  placeholder_msg_id INTEGER,
+  inline_message_id TEXT,                         -- Guest 模式:回填目标 inline 消息
+  error TEXT, created_at INTEGER, finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_gen_task ON generations(task_id);
 CREATE INDEX IF NOT EXISTS idx_gen_status ON generations(status);

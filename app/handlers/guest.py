@@ -13,9 +13,11 @@ from aiogram.types import Message
 
 from app.core.streaming import EditRenderer, GuestRenderer
 from app.db.models import User
+from app.handlers.guest_commands import answer_guest_text, execute_guest_command
 from app.handlers.media import build_content
 from app.handlers.mentions import strip_bot_mention
 from app.handlers.pipeline import run_chat_pipeline
+from app.handlers.replies import fold_reply_context
 from app.logging import get_logger
 from app.services import Services
 
@@ -26,61 +28,15 @@ router = Router(name="guest")
 
 @router.guest_message()
 async def handle_guest(message: Message, user: User, svc: Services) -> None:
+    # 斜杠命令分流:Guest 消息不走 @router.message,需在此显式拦截文本命令。
+    guest_query_id = getattr(message, "guest_query_id", None)
+    if (message.text or "").startswith("/"):
+        response = await execute_guest_command(svc, user, message)
+        if response is not None and guest_query_id:
+            await answer_guest_text(svc.bot, str(guest_query_id), response)
+            return
+        # 未知命令 → 落入 AI 流程(自然语言处理)
     await process_guest_message(message, user, svc)
-
-
-def _as_blocks(content: Any) -> list[dict[str, Any]]:
-    if isinstance(content, str):
-        return [{"type": "text", "text": content}]
-    return list(content)
-
-
-def _content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    return "\n".join(
-        str(block.get("text", ""))
-        for block in content
-        if block.get("type") == "text" and block.get("text")
-    )
-
-
-def _with_reply_context(
-    content: Any,
-    question_text: str,
-    reply_content: Any | None,
-    reply_text: str,
-) -> Any:
-    blocks: list[dict[str, Any]] = []
-    text_parts: list[str] = []
-    if reply_text:
-        text_parts.append(f"[引用的消息]\n{reply_text}")
-
-    text_parts.append(f"[召唤者的问题]\n{question_text}")
-    blocks.append({"type": "text", "text": "\n\n".join(text_parts)})
-
-    if reply_content is not None:
-        for block in _as_blocks(reply_content):
-            if block.get("type") == "text" and reply_text:
-                continue
-            blocks.append(block)
-
-    blocks.extend(block for block in _as_blocks(content) if block.get("type") != "text")
-
-    if len(blocks) == 1 and blocks[0].get("type") == "text":
-        return blocks[0]["text"]
-    return blocks
-
-
-def _reply_source(message: Message) -> Any | None:
-    return message.reply_to_message or getattr(message, "external_reply", None)
-
-
-def _reply_quote_text(message: Message, reply: Any) -> str:
-    if reply is message.reply_to_message:
-        return ""
-    quote = getattr(message, "quote", None)
-    return getattr(quote, "text", "") or ""
 
 
 async def process_guest_message(message: Message, user: User, svc: Services) -> None:
@@ -105,19 +61,8 @@ async def process_guest_message(message: Message, user: User, svc: Services) -> 
                 block["text"] = strip_bot_mention(block["text"], me.username or "")
         query_text = strip_bot_mention(query_text, me.username or "")
 
-    # Guest 无历史:附引用消息作为唯一上下文。只清理当前召唤消息,不改引用原文。
-    reply = _reply_source(message)
-    if reply:
-        reply_content, _reply_query = await build_content(svc, reply)
-        reply_text = _content_text(reply_content) if reply_content is not None else ""
-        if not reply_text:
-            reply_text = _reply_quote_text(message, reply)
-        if reply_content is not None or reply_text:
-            content = _with_reply_context(content, query_text, reply_content, reply_text)
-            if reply_text:
-                query_text = f"[引用的消息]\n{reply_text}\n\n[召唤者的问题]\n{query_text}"
-            else:
-                query_text = f"[召唤者的问题]\n{query_text}"
+    # Guest 无历史:附引用消息作为唯一上下文(逻辑见 replies.py,三场景共用)。
+    content, query_text = await fold_reply_context(svc, message, content, query_text)
 
     if guest_query_id:
         renderer: Any = GuestRenderer(svc.bot, message.chat.id, str(guest_query_id),

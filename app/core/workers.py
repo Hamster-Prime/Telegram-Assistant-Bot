@@ -9,10 +9,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from aiogram import Bot
-from aiogram.types import BufferedInputFile, URLInputFile
+from aiogram.methods import EditMessageMedia
+from aiogram.types import (
+    BufferedInputFile,
+    InputMediaAudio,
+    InputMediaVideo,
+)
 
 from app.core.concurrency import ConcurrencyGuard, SendRateLimiter, TaskRegistry
 from app.db.dao import DAOBundle
@@ -63,8 +68,12 @@ class GenWorkerPool:
     # ── 视频 ───────────────────────────────────────────────────
     async def submit_video(self, user: User, chat_id: int, prompt: str,
                            *, duration: int = 6, resolution: str = "768P",
-                           placeholder_msg_id: int | None = None) -> tuple[int, str]:
-        """建视频任务并启动后台轮询。返回 (gen_id, task_id)。handler 快速返回。"""
+                           placeholder_msg_id: int | None = None,
+                           inline_message_id: str | None = None) -> tuple[int, str]:
+        """建视频任务并启动后台轮询。返回 (gen_id, task_id)。handler 快速返回。
+
+        inline_message_id 非 None 时为 Guest 模式:回填写入该 inline 消息。
+        """
         task_id = await self._video.create_task(
             prompt, duration=duration, resolution=resolution,
             callback_url=self._callback_url or None,
@@ -73,12 +82,14 @@ class GenWorkerPool:
             id=None, user_id=user.tg_id, chat_id=chat_id, kind="video",
             model=self._video._model, prompt=prompt, status="processing",
             task_id=task_id, placeholder_msg_id=placeholder_msg_id,
+            inline_message_id=inline_message_id,
         )
         gen_id = await self._daos.generations.create(gen)
         self._registry.spawn(self._poll_video(gen_id, task_id, user),
                              name=f"poll-video-{gen_id}")
         log.info("视频任务已提交后台", 生成编号=gen_id, 任务ID=task_id,
-                 用户=user.tg_id, 会话=chat_id)
+                 用户=user.tg_id, 会话=chat_id,
+                 投递方式="Guest-inline" if inline_message_id else "直发")
         return gen_id, task_id
 
     async def _poll_video(self, gen_id: int, task_id: str, user: User) -> None:
@@ -116,7 +127,11 @@ class GenWorkerPool:
         await self._fail_generation(gen_id, f"视频生成超时(>{POLL_MAX_TOTAL_S}秒)", user)
 
     async def finalize_video(self, gen_id: int, file_id: str, *, source: str) -> None:
-        """成功回填:取文件 URL → 下载 → sendVideo → 结算配额。幂等。"""
+        """成功回填:取文件 URL → 投递 → 结算配额。幂等。
+
+        Guest(inline_message_id)用 editMessageMedia 回填 inline 消息(URL);
+        否则下载字节 sendVideo 直发(现行行为)。
+        """
         if gen_id in self._finalizing:
             log.info("回填去重(已在处理)", 生成编号=gen_id, 来源=source)
             return
@@ -128,13 +143,24 @@ class GenWorkerPool:
                 return
             log.info("视频回填开始", 生成编号=gen_id, 文件ID=file_id, 来源=source)
             url = await self._files.retrieve_url(file_id)
-            data = await self._files.download(url)
-            await self._limiter.acquire()
-            await self._bot.send_video(
-                gen.chat_id,
-                BufferedInputFile(data, filename=f"video_{gen_id}.mp4"),
-                caption=f"🎬 视频已生成:{gen.prompt[:100]}",
-            )
+            caption = f"🎬 视频已生成:{gen.prompt[:100]}"
+            if gen.inline_message_id:
+                # Guest:inline editMessageMedia(URL),失败降级为文本+链接
+                media = InputMediaVideo(media=url, caption=caption)
+                ok = await self._edit_inline_media(gen.inline_message_id, media)
+                if not ok:
+                    await self._edit_inline_text(
+                        gen.inline_message_id, f"{caption}\n\n{url}")
+                data_len = 0
+            else:
+                data = await self._files.download(url)
+                data_len = len(data)
+                await self._limiter.acquire()
+                await self._bot.send_video(
+                    gen.chat_id,
+                    BufferedInputFile(data, filename=f"video_{gen_id}.mp4"),
+                    caption=caption,
+                )
             await self._daos.generations.update_status(
                 gen_id, "success", file_id=file_id, result_url=url, finished=True
             )
@@ -144,7 +170,7 @@ class GenWorkerPool:
                 await self._quota.settle(user, "calls", self._quota.call_weight("video"),
                                          chat_id=gen.chat_id, kind="video")
             log.info("视频回填完成", 生成编号=gen_id, 来源=source,
-                     大小KB=round(len(data) / 1024, 1))
+                     大小KB=round(data_len / 1024, 1))
         except Exception as e:
             log.error("视频回填失败", 生成编号=gen_id, 异常类型=type(e).__name__,
                       详情=str(e)[:300])
@@ -165,19 +191,25 @@ class GenWorkerPool:
     # ── 音乐 ───────────────────────────────────────────────────
     async def submit_music(self, user: User, chat_id: int, prompt: str,
                            *, lyrics: str | None = None, is_instrumental: bool = False,
-                           placeholder_msg_id: int | None = None) -> int:
-        """音乐生成放后台任务(接口同步但耗时长)。返回 gen_id,handler 立即返回。"""
+                           placeholder_msg_id: int | None = None,
+                           inline_message_id: str | None = None) -> int:
+        """音乐生成放后台任务(接口同步但耗时长)。返回 gen_id,handler 立即返回。
+
+        inline_message_id 非 None 时为 Guest 模式:回填写入该 inline 消息。
+        """
         gen = Generation(
             id=None, user_id=user.tg_id, chat_id=chat_id, kind="music",
             model=self._music._model, prompt=prompt, status="processing",
             placeholder_msg_id=placeholder_msg_id,
+            inline_message_id=inline_message_id,
         )
         gen_id = await self._daos.generations.create(gen)
         self._registry.spawn(
             self._run_music(gen_id, user, prompt, lyrics, is_instrumental),
             name=f"music-{gen_id}",
         )
-        log.info("音乐任务已提交后台", 生成编号=gen_id, 用户=user.tg_id, 会话=chat_id)
+        log.info("音乐任务已提交后台", 生成编号=gen_id, 用户=user.tg_id, 会话=chat_id,
+                 投递方式="Guest-inline" if inline_message_id else "直发")
         return gen_id
 
     async def _run_music(self, gen_id: int, user: User, prompt: str,
@@ -190,22 +222,34 @@ class GenWorkerPool:
             gen = await self._daos.generations.get(gen_id)
             if gen is None:
                 return
-            await self._limiter.acquire()
-            if audio_bytes:
-                await self._bot.send_audio(
-                    gen.chat_id,
-                    BufferedInputFile(audio_bytes, filename=f"music_{gen_id}.mp3"),
-                    caption=f"🎵 音乐已生成:{prompt[:100]}",
-                )
-            elif audio_url:
-                data = await self._files.download(audio_url)
-                await self._bot.send_audio(
-                    gen.chat_id,
-                    BufferedInputFile(data, filename=f"music_{gen_id}.mp3"),
-                    caption=f"🎵 音乐已生成:{prompt[:100]}",
-                )
+            caption = f"🎵 音乐已生成:{prompt[:100]}"
+            if gen.inline_message_id:
+                # Guest:inline editMessageMedia(URL),失败降级为文本+链接
+                url = audio_url
+                if not url:
+                    raise RuntimeError("Guest 模式音乐回填需要 URL,未返回")
+                media = InputMediaAudio(media=url, caption=caption)
+                ok = await self._edit_inline_media(gen.inline_message_id, media)
+                if not ok:
+                    await self._edit_inline_text(
+                        gen.inline_message_id, f"{caption}\n\n{url}")
             else:
-                raise RuntimeError("MiniMax 未返回音频数据")
+                await self._limiter.acquire()
+                if audio_bytes:
+                    await self._bot.send_audio(
+                        gen.chat_id,
+                        BufferedInputFile(audio_bytes, filename=f"music_{gen_id}.mp3"),
+                        caption=caption,
+                    )
+                elif audio_url:
+                    data = await self._files.download(audio_url)
+                    await self._bot.send_audio(
+                        gen.chat_id,
+                        BufferedInputFile(data, filename=f"music_{gen_id}.mp3"),
+                        caption=caption,
+                    )
+                else:
+                    raise RuntimeError("MiniMax 未返回音频数据")
             await self._daos.generations.update_status(gen_id, "success",
                                                        result_url=audio_url, finished=True)
             await self._edit_placeholder(gen, "✅ 音乐已生成完毕,见下方")
@@ -229,6 +273,29 @@ class GenWorkerPool:
         except Exception as e:
             log.debug("占位消息编辑失败(忽略)", 生成编号=gen.id, 错误=str(e)[:120])
 
+    async def _edit_inline_media(self, inline_message_id: str, media: Any) -> bool:
+        """Guest:把 inline 消息转成媒体(editMessageMedia,仅 URL)。成功 True。"""
+        try:
+            await self._limiter.acquire()
+            await self._bot(EditMessageMedia(
+                inline_message_id=inline_message_id, media=media,
+            ))
+            return True
+        except Exception as e:
+            log.warning("Guest inline 媒体回填失败(将降级)", 内联ID=inline_message_id,
+                        错误=str(e)[:160])
+            return False
+
+    async def _edit_inline_text(self, inline_message_id: str, text: str) -> None:
+        """Guest:编辑 inline 消息文本(媒体回填降级 / 失败提示)。纯文本,裸 URL 自动链接。"""
+        try:
+            await self._limiter.acquire()
+            await self._bot.edit_message_text(
+                text, inline_message_id=inline_message_id,
+            )
+        except Exception as e:
+            log.debug("Guest inline 文本编辑失败(忽略)", 错误=str(e)[:120])
+
     async def _fail_generation(self, gen_id: int, reason: str, user: User | None) -> None:
         gen = await self._daos.generations.get(gen_id)
         if gen is None or gen.status in ("success", "failed"):
@@ -240,11 +307,15 @@ class GenWorkerPool:
         text = f"❌ {kind_zh}生成失败:{reason[:200]}"
         await self._edit_placeholder(gen, text)
         if not gen.placeholder_msg_id:
-            try:
-                await self._limiter.acquire()
-                await self._bot.send_message(gen.chat_id, text)
-            except Exception as e:
-                log.error("失败通知发送失败", 生成编号=gen_id, 错误=str(e)[:120])
+            if gen.inline_message_id:
+                # Guest:编辑 inline 消息给出失败提示
+                await self._edit_inline_text(gen.inline_message_id, text)
+            else:
+                try:
+                    await self._limiter.acquire()
+                    await self._bot.send_message(gen.chat_id, text)
+                except Exception as e:
+                    log.error("失败通知发送失败", 生成编号=gen_id, 错误=str(e)[:120])
         log.warning("生成任务标记失败", 生成编号=gen_id, 类型=gen.kind, 原因=reason[:200])
 
     # ── 重启恢复(L5) ─────────────────────────────────────────

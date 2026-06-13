@@ -282,10 +282,12 @@ class GenerationDAO:
     async def create(self, gen: Generation) -> int:
         rid = await self.db.execute(
             """INSERT INTO generations
-               (user_id, chat_id, kind, model, prompt, status, task_id, placeholder_msg_id, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (user_id, chat_id, kind, model, prompt, status, task_id,
+                placeholder_msg_id, inline_message_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (gen.user_id, gen.chat_id, gen.kind, gen.model, gen.prompt,
-             gen.status, gen.task_id, gen.placeholder_msg_id, _now()),
+             gen.status, gen.task_id, gen.placeholder_msg_id,
+             gen.inline_message_id, _now()),
         )
         log.info("生成任务已落库", 编号=rid, 类型=gen.kind, 模型=gen.model,
                  用户=gen.user_id, 任务ID=gen.task_id, 状态=gen.status)

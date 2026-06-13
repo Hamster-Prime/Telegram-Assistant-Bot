@@ -10,6 +10,7 @@ from app.db.models import User
 from app.handlers.media import build_content
 from app.handlers.mentions import contains_bot_mention, strip_bot_mention
 from app.handlers.pipeline import run_chat_pipeline
+from app.handlers.replies import fold_reply_context
 from app.logging import get_logger
 from app.services import Services
 
@@ -56,6 +57,8 @@ async def handle_group(message: Message, user: User, svc: Services) -> None:
     renderer = EditRenderer(svc.bot, message.chat.id, svc.limiter,
                             throttle_ms=svc.settings.edit_throttle_ms,
                             reply_to_message_id=message.message_id)
+    # 群聊回复上下文同样折叠进 content(避免模型只看到主消息文本)。
+    content, query_text = await fold_reply_context(svc, message, content, query_text)
     # 群聊隐私隔离:scope=chat
     await run_chat_pipeline(svc, user, message, content, renderer,
                             scope="chat", query_text=query_text)

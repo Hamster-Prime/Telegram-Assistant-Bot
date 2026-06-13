@@ -13,12 +13,18 @@ from __future__ import annotations
 import html
 import re
 import secrets
-from typing import Protocol
+from typing import Any, Protocol
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import AnswerGuestQuery, SendMessageDraft
-from aiogram.types import InlineQueryResultArticle, InputTextMessageContent
+from aiogram.methods import AnswerGuestQuery, EditMessageMedia, SendMessageDraft
+from aiogram.types import (
+    InlineQueryResultArticle,
+    InputMediaAudio,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputTextMessageContent,
+)
 
 from app.core.concurrency import SendRateLimiter
 from app.core.ratelimit import EditThrottle
@@ -271,6 +277,16 @@ class GuestRenderer:
         self._limiter = limiter
         self._throttle = EditThrottle(throttle_ms=throttle_ms)
         self._inline_message_id: str | None = None
+        # Guest 单 inline 消息:同步生成的图片/语音暂存于此,finalize 时转为媒体
+        self._pending_media: dict[str, Any] | None = None
+
+    def attach_pending(self, kind: str, url: str, note: str | None) -> None:
+        """暂存一个待投递媒体(图片=photo / 语音=audio)。仅保留首个。
+
+        Guest 仅一条 inline 消息,故多媒体只展示第一个;note 追加到 caption。
+        """
+        if self._pending_media is None:
+            self._pending_media = {"kind": kind, "url": url, "note": note or ""}
 
     async def start(self) -> None:
         try:
@@ -326,12 +342,52 @@ class GuestRenderer:
             log.warning("Guest编辑更新失败(忽略)", 会话=self._chat_id,
                         错误=str(e)[:120])
 
+    async def _edit_media(self, media: Any) -> bool:
+        """把 inline 消息转成媒体(editMessageMedia)。成功返回 True。"""
+        if self._inline_message_id is None:
+            return False
+        try:
+            await self._limiter.acquire()
+            await self._bot(EditMessageMedia(
+                inline_message_id=self._inline_message_id,
+                media=media,
+            ))
+            return True
+        except Exception as e:
+            log.warning("Guest媒体编辑失败(降级为文本)", 会话=self._chat_id,
+                        错误=str(e)[:160])
+            return False
+
     async def finalize(self, full_text: str) -> int | None:
-        await self._edit(full_text.strip() or "(空回复)")
+        text = (full_text.strip() or "(空回复)")
+        pm = self._pending_media
+        if pm and self._inline_message_id is not None:
+            caption = _render_for_telegram(text)
+            note = pm.get("note") or ""
+            if note:
+                caption = (caption + "\n" + note)[:TG_MESSAGE_LIMIT]
+            kind, url = pm["kind"], pm["url"]
+            media = self._build_media(kind, url, caption)
+            ok = await self._edit_media(media)
+            if not ok:
+                # 降级:文本 + 可点击链接(URL 媒体体积超限等情况)
+                link_line = f"\n\n✅ 已生成:[查看]({url})"
+                await self._edit(text + link_line)
+        else:
+            await self._edit(text)
         log.info("Guest回复已定稿", 会话=self._chat_id,
                  内联消息ID=self._inline_message_id or "无",
-                 长度=len(full_text))
+                 形式=pm["kind"] if pm else "文本", 长度=len(full_text))
         return None
+
+    @staticmethod
+    def _build_media(kind: str, url: str, caption: str) -> Any:
+        if kind == "photo":
+            return InputMediaPhoto(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
+        if kind == "video":
+            return InputMediaVideo(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
+        # audio(语音合成):Guest 无 Voice 类型,按 Audio 投递
+        return InputMediaAudio(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
 
     async def fail(self, error_text: str) -> None:
         try:

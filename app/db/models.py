@@ -100,6 +100,7 @@ class Generation:
     file_id: str | None = None
     result_url: str | None = None
     placeholder_msg_id: int | None = None
+    inline_message_id: str | None = None  # Guest 模式:回填目标 inline 消息
     error: str | None = None
     created_at: int | None = None
     finished_at: int | None = None

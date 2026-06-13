@@ -43,8 +43,18 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         schema = _SCHEMA_PATH.read_text(encoding="utf-8")
         await self._conn.executescript(schema)
+        await self._migrate_generations_inline()
         await self._conn.commit()
         log.info("数据库已连接", 路径=str(self._path), WAL模式=self._wal)
+
+    async def _migrate_generations_inline(self) -> None:
+        """老库无 inline_message_id 列时幂等补列(Guest 媒体回填所需)。"""
+        async with self.conn.execute("PRAGMA table_info(generations)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "inline_message_id" not in cols:
+            await self.conn.execute(
+                "ALTER TABLE generations ADD COLUMN inline_message_id TEXT")
+            log.info("已迁移:generations 增加 inline_message_id 列")
 
     async def close(self) -> None:
         if self._conn is not None:

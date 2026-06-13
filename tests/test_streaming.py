@@ -11,6 +11,7 @@ from app.core.ratelimit import EditThrottle
 from app.core.streaming import (
     DraftRenderer,
     EditRenderer,
+    GuestRenderer,
     TG_MESSAGE_LIMIT,
     _render_for_telegram,
     clip,
@@ -148,3 +149,81 @@ async def test_draft_renderer_does_not_send_initial_placeholder_in_private(limit
     assert bot.methods == []
     assert bot.sent == [(42, "<b>最终回复</b>")]
     assert bot.sent_kwargs[-1].get("parse_mode") == "HTML"
+
+
+# ── GuestRenderer:媒体投递(修复项)─────────────────────────────
+class GuestFakeBot:
+    """支持 __call__(AnswerGuestQuery/EditMessageMedia)的假 Bot。"""
+
+    def __init__(self, inline_message_id: str = "inline-1"):
+        self._inline_id = inline_message_id
+        self.media_edits: list = []  # EditMessageMedia 调用
+        self.text_edits: list = []   # edit_message_text 调用
+
+    async def __call__(self, method):
+        from aiogram.methods import AnswerGuestQuery, EditMessageMedia
+        if isinstance(method, AnswerGuestQuery):
+            from types import SimpleNamespace
+            return SimpleNamespace(inline_message_id=self._inline_id)
+        if isinstance(method, EditMessageMedia):
+            self.media_edits.append(method)
+            from types import SimpleNamespace
+            return SimpleNamespace(ok=True)
+        return None
+
+    async def edit_message_text(self, text, **kwargs):
+        self.text_edits.append((text, kwargs))
+
+
+async def test_guest_renderer_text_finalize_no_media(limiter):
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    assert r._inline_message_id == "inline-1"
+    await r.finalize("普通文本回复")
+    assert bot.media_edits == []  # 无媒体
+    assert bot.text_edits and bot.text_edits[-1][0] == "普通文本回复"
+
+
+async def test_guest_renderer_finalizes_as_photo_when_pending(limiter):
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    r.attach_pending("photo", "https://cdn.test/img.jpg", note="备注")
+    await r.finalize("看这张图")
+
+    assert len(bot.media_edits) == 1
+    media = bot.media_edits[0].media
+    from aiogram.types import InputMediaPhoto
+    assert isinstance(media, InputMediaPhoto)
+    assert media.media == "https://cdn.test/img.jpg"
+    assert "看这张图" in media.caption
+    assert "备注" in media.caption  # note 追加到 caption
+
+
+async def test_guest_renderer_finalizes_as_audio_for_voice(limiter):
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    # GuestDelivery.send_voice 走 audio
+    r.attach_pending("audio", "https://cdn.test/speech.mp3", note=None)
+    await r.finalize("已朗读")
+
+    assert len(bot.media_edits) == 1
+    from aiogram.types import InputMediaAudio
+    assert isinstance(bot.media_edits[0].media, InputMediaAudio)
+    assert bot.media_edits[0].media.media == "https://cdn.test/speech.mp3"
+
+
+async def test_guest_renderer_only_first_media_attached(limiter):
+    """Guest 单 inline 消息:多个 attach_pending 只保留第一个。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    r.attach_pending("photo", "https://cdn.test/a.jpg", note=None)
+    r.attach_pending("photo", "https://cdn.test/b.jpg", note=None)
+    assert r._pending_media["url"] == "https://cdn.test/a.jpg"
