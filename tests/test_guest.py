@@ -674,3 +674,117 @@ async def test_guest_reset_command_uses_logic(monkeypatch):
         make_guest_message("/reset"))
     assert called["reset"] is True
     assert result == "🧹 已清空"
+
+
+# ── handle_guest 入口:命令路由(修复 @bot /cmd 漏判)─────────────
+async def test_handle_guest_routes_mention_prefixed_command(monkeypatch):
+    """@my_bot /help 经 handle_guest 走命令分流,不落入 AI。
+
+    回归:inline 启动器发出的命令形如 "@bot /help",以 @ 开头,
+    旧逻辑 startswith("/") 漏判导致落入 AI 流程。
+    """
+    answered: dict = {}
+
+    async def fake_answer(bot, guest_query_id, text):
+        answered["text"] = text
+
+    pipeline_called = {"n": 0}
+
+    async def fake_pipeline(*args, **kwargs):
+        pipeline_called["n"] += 1
+
+    monkeypatch.setattr(guest, "answer_guest_text", fake_answer)
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("@my_bot /help")
+
+    await guest.handle_guest(message, user, svc)
+
+    assert "助理机器人" in answered.get("text", "")
+    assert pipeline_called["n"] == 0  # 未落入 AI
+
+
+async def test_handle_guest_routes_bare_command(monkeypatch):
+    """纯 /help(无 @bot 前缀)仍正常走命令分流。"""
+    answered: dict = {}
+
+    async def fake_answer(bot, guest_query_id, text):
+        answered["text"] = text
+
+    async def fake_pipeline(*args, **kwargs):
+        raise AssertionError("不应落入 AI 流程")
+
+    monkeypatch.setattr(guest, "answer_guest_text", fake_answer)
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("/help")
+
+    await guest.handle_guest(message, user, svc)
+    assert "助理机器人" in answered.get("text", "")
+
+
+async def test_handle_guest_unknown_command_falls_through_to_ai(monkeypatch):
+    """@my_bot /unknowncmd 未知命令 → 落入 AI 流程。"""
+    answered: dict = {}
+
+    async def fake_answer(bot, guest_query_id, text):
+        answered["text"] = text
+
+    pipeline_called = {"n": 0}
+
+    async def fake_pipeline(*args, **kwargs):
+        pipeline_called["n"] += 1
+
+    class FakeGuestRenderer:
+        def __init__(self, *a, **kw):
+            pass
+
+    monkeypatch.setattr(guest, "answer_guest_text", fake_answer)
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("@my_bot /totallyunknown")
+
+    await guest.handle_guest(message, user, svc)
+    assert pipeline_called["n"] == 1  # 落入 AI
+
+
+async def test_handle_guest_plain_text_goes_to_ai(monkeypatch):
+    """@my_bot 普通文本 → 走 AI 流程(非命令)。"""
+    pipeline_called = {"n": 0}
+
+    async def fake_pipeline(*args, **kwargs):
+        pipeline_called["n"] += 1
+
+    class FakeGuestRenderer:
+        def __init__(self, *a, **kw):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("@my_bot 讲个笑话")
+
+    await guest.handle_guest(message, user, svc)
+    assert pipeline_called["n"] == 1
+
+
+async def test_execute_guest_command_strips_mention_prefix():
+    """execute_guest_command 带 bot_username 时剥离 @bot 前缀后再解析命令。"""
+    from app.handlers import guest_commands
+    svc = make_svc()
+    user = User(tg_id=77, first_name="C")
+    # @my_bot /help → 剥离后 /help → 命中 help 命令
+    message = make_guest_message("@my_bot /help")
+    result = await guest_commands.execute_guest_command(
+        svc, user, message, bot_username="my_bot")
+    assert result is not None
+    assert "助理机器人" in result

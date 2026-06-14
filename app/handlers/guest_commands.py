@@ -55,14 +55,18 @@ async def answer_guest_text(bot: Bot, guest_query_id: str, text: str) -> None:
 
 
 async def execute_guest_command(
-    svc: Services, user: User, message: Message,
+    svc: Services, user: User, message: Message, bot_username: str = "",
 ) -> str | None:
     """解析并执行 guest 消息中的斜杠命令。返回应答文本;非已知命令返回 None。
 
     返回 None 时,调用方应把消息作为普通对话交给 AI 流程。
+    bot_username 用于剥离消息中的 @bot 提及(inline 启动器发出的命令带提及前缀)。
     """
-    text = message.text or ""
-    cmd, args = _split_command(text)
+    raw = message.text or ""
+    if bot_username:
+        from app.handlers.mentions import strip_bot_mention
+        raw = strip_bot_mention(raw, bot_username)
+    cmd, args = _split_command(raw)
     if not cmd:
         return None
 

@@ -34,9 +34,14 @@ router = Router(name="guest")
 @router.guest_message()
 async def handle_guest(message: Message, user: User, svc: Services) -> None:
     # 斜杠命令分流:Guest 消息不走 @router.message,需在此显式拦截文本命令。
+    # 注意:inline 启动器发出的消息形如 "@bot /help",以 @ 开头,
+    # 必须先剥离 bot 提及再判断是否以 / 开头,否则命令会被漏判落入 AI 流程。
     guest_query_id = getattr(message, "guest_query_id", None)
-    if (message.text or "").startswith("/"):
-        response = await execute_guest_command(svc, user, message)
+    me = await svc.bot.me()
+    bot_username = me.username or ""
+    stripped_text = strip_bot_mention(message.text or "", bot_username)
+    if stripped_text.startswith("/"):
+        response = await execute_guest_command(svc, user, message, bot_username)
         if response is not None and guest_query_id:
             await answer_guest_text(svc.bot, str(guest_query_id), response)
             return
