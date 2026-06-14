@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.streaming import StreamRenderer, _status_for_tool
+from app.core.streaming import _STATUS_THINKING, StreamRenderer, _status_for_tool
 from app.core.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.logging import get_logger
 from app.minimax.chat import ChatAPI
@@ -58,8 +58,8 @@ class Agent:
             pending_calls = []
             finish = ""
 
-            # 每轮流式开始前显示「正在思考」(首轮亦然,占位阶段即可见)
-            await renderer.set_status("正在思考 ...")
+            # 每轮流式开始前显示「正在处理」(首轮亦然,占位阶段即可见)
+            await renderer.set_status(_STATUS_THINKING)
 
             try:
                 async for ev in self._chat.stream_chat(convo, tools=tools):

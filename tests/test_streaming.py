@@ -117,7 +117,7 @@ async def test_edit_renderer_lifecycle(limiter):
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1,
                      typing_refresh_s=10)
     await r.start()
-    assert bot.sent == [(42, "▌")]  # 占位
+    assert bot.sent == [(42, "<i>正在处理 ...</i>")]  # 占位(初始即状态行)
 
     await r.update("第一段")
     await asyncio.sleep(0.02)  # 让轮询循环 tick 一次
@@ -338,11 +338,11 @@ async def test_tick_loop_respects_interval(limiter):
 # ── 状态行:占位/内容渲染(idle 不发编辑)─────────────────
 
 async def test_placeholder_shows_status_line(limiter):
-    """首条内容前,占位消息显示状态行文本(默认「正在思考 ...」),不再 ▌/nbsp 交替。"""
+    """首条内容前,占位消息显示状态行文本(set_status 驱动),不再 ▌/nbsp 交替。"""
     bot = FakeBot()
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=10,
                      typing_refresh_s=10)
-    await r.start()  # 占位发送 "▌"(sendMessage,记入 bot.sent)
+    await r.start()  # 占位发送初始状态行(sendMessage,记入 bot.sent)
     # 占位阶段改状态,让 tick 落地状态行
     await r.set_status("正在思考 ...")
     await asyncio.sleep(0.04)
@@ -366,7 +366,7 @@ async def test_content_edit_has_status_line_suffix(limiter):
     first = bot.text_edits[0][0]
     assert "正文内容" in first
     assert "▌" not in first, "不应含光标"
-    assert "正在思考 ..." in first, "应含默认状态行"
+    assert "正在处理 ..." in first, "应含默认状态行"
     await r.finalize("正文内容完成")
 
 
@@ -607,7 +607,7 @@ async def test_placeholder_dedup_when_status_unchanged(limiter):
     r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
                       limiter=limiter, throttle_ms=1)
     await r.start()
-    # 占位阶段,状态保持默认「正在思考 ...」,等待多个 tick
+    # 占位阶段,状态保持默认「正在处理 ...」,等待多个 tick
     await asyncio.sleep(0.05)
     n1 = len(bot.text_edits)
     # 再等更多 tick,状态仍不变
@@ -667,7 +667,7 @@ async def test_set_status_after_content_renders_body_plus_status(limiter):
     assert len(new_edits) >= 1, "set_status 应主动发一次编辑"
     assert "第一轮正文" in new_edits[-1][0]
     assert "正在搜索 ..." in new_edits[-1][0]
-    assert "正在思考" not in new_edits[-1][0]  # 旧状态已被替换
+    assert "正在处理" not in new_edits[-1][0]  # 旧状态已被替换
     # _committed 不应被 set_status 改动
     assert r._committed == "第一轮正文"
     await r.finalize("第一轮正文完成")

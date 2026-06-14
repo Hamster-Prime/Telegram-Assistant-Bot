@@ -19,7 +19,7 @@ Edit/Guest 渲染器用「单一后台轮询循环」按设定间隔驱动所有
 update() 仅暂存最新文本,真正发编辑的是循环。每次 tick 三选一:
   ① 有新内容 → 写入正文 + 空行 + 状态行(不带光标)
   ② 内容静默(idle)→ no-op,不再发编辑(缓解 429 的核心)
-  ③ 占位阶段(首条内容前)→ 渲染纯状态行(默认「正在思考 ...」)
+  ③ 占位阶段(首条内容前)→ 渲染纯状态行(默认「正在处理 ...」)
 状态行文案的切换由 set_status 驱动(Agent 在工具调用前下发),而非光标闪烁。
 间隔门控保证「同一消息任意两次 edit(无论内容/状态行/定稿)距离 ≥ 设定值」:
 tick 循环 wait_for 强制间隔;_do_edit 咽喉点在 HTTP 调用前记录时间戳,
@@ -60,7 +60,7 @@ _SEARCH_TOOLS = frozenset({"web_search", "web_fetch"})
 _GENERATE_TOOLS = frozenset({
     "generate_image", "generate_video", "synthesize_speech", "generate_music",
 })
-_STATUS_THINKING = "正在思考 ..."
+_STATUS_THINKING = "正在处理 ..."
 _STATUS_TOOL_DEFAULT = "正在调用工具 ..."
 
 
@@ -102,7 +102,7 @@ class StreamRenderer(Protocol):
         ...
 
     async def set_status(self, status: str) -> None:
-        """设置当前状态行文案(如「正在思考 ...」)并立即渲染。
+        """设置当前状态行文案(如「正在处理 ...」)并立即渲染。
 
         主动发一次编辑:正文已落地则渲染「正文+状态行」,占位阶段则渲染纯状态行。
         走与轮询循环相同的间隔门控(429 安全)。DraftRenderer 是 no-op(无后缀概念)。
@@ -348,7 +348,7 @@ class _TickLoopMixin:
     每个 interval 做 1 次 tick,三选一(见 _tick_loop 文档):
       ① 有新内容 → 写正文 + 空行 + 状态行
       ② 内容静默 → idle no-op(不再编辑 —— 缓解 429 的核心)
-      ③ 占位阶段 → 渲染纯状态行(默认「正在思考 ...」)
+      ③ 占位阶段 → 渲染纯状态行(默认「正在处理 ...」)
     状态行的切换由 set_status 驱动(而非光标闪烁)。
     间隔门控(_do_edit 咽喉点时间戳 + _ensure_interval_elapsed)保证「同一消息
     任意两次 edit 距离 ≥ interval」,杜绝多源并发与 finalize 触发的 429。
@@ -369,7 +369,7 @@ class _TickLoopMixin:
         self._tick_task = None
         self._pending = None
         self._committed = ""
-        self._status = "正在思考 ..."
+        self._status = _STATUS_THINKING
         self._last_placeholder_render = ""
         self._last_edit_time = 0.0
 
@@ -423,7 +423,7 @@ class _TickLoopMixin:
         1. 有新内容(_pending != _committed):写入正文 + 空行 + 状态行(无光标)。
         2. 内容静默(_committed 非空、无新内容):idle no-op,不再编辑 ——
            这是缓解 429 的核心。状态行切换由 set_status 驱动,落到分支 1/3。
-        3. 占位阶段(首条内容前):渲染纯状态行(默认「正在思考 ...」)。
+        3. 占位阶段(首条内容前):渲染纯状态行(默认「正在处理 ...」)。
         """
         try:
             while not self._stop.is_set():
@@ -486,7 +486,7 @@ class EditRenderer(_TickLoopMixin):
     def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
                  throttle_ms: int = 3000,
                  reply_to_message_id: int | None = None,
-                 placeholder: str = "▌", *,
+                 placeholder: str = "<i>" + _STATUS_THINKING + "</i>", *,
                  typing_refresh_s: float = 4.0) -> None:
         self._bot = bot
         self._chat_id = chat_id
@@ -534,7 +534,7 @@ class EditRenderer(_TickLoopMixin):
         self._typing_task = asyncio.create_task(
             _run_typing_loop(self._bot, self._chat_id, self._limiter,
                              self._typing_refresh_s, self._typing_stop))
-        # 启动统一轮询循环(内容更新 + 闪烁共用间隔)
+        # 启动统一轮询循环(内容更新与状态行共用间隔,idle 不发编辑)
         self._tick_task = asyncio.create_task(
             self._tick_loop(self._do_edit))
 
@@ -627,7 +627,7 @@ class GuestRenderer(_TickLoopMixin):
     返回 SentGuestMessage.inline_message_id,后续在其上统一轮询编辑。
 
     typing:Guest bot 非会话成员,**不支持** sendChatAction(仅 answerGuestQuery
-    通道)。故用「状态行」(set_status 驱动,如「正在思考 ...」)作为唯一
+    通道)。故用「状态行」(set_status 驱动,如「正在处理 ...」)作为唯一
     「工作中」信号 —— 由统一轮询循环在占位/内容写入期渲染(idle 不发编辑)。
     """
 
@@ -659,7 +659,7 @@ class GuestRenderer(_TickLoopMixin):
                     id=self._guest_query_id[:60] or "answer",
                     title="回复",
                     input_message_content=InputTextMessageContent(
-                        message_text=_render_for_telegram("▌"),
+                        message_text=_render_for_telegram("<i>" + _STATUS_THINKING + "</i>"),
                         parse_mode=TG_PARSE_MODE,
                     ),
                 ),

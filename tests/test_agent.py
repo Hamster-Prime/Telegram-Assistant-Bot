@@ -265,9 +265,9 @@ async def test_agent_sets_status_on_tool_phase():
     await agent.run([{"role": "user", "content": "搜一下"}], r, ToolDispatcher())
 
     statuses = getattr(r, "statuses", [])
-    # 进入第一轮流式前应发「正在思考」
-    assert "正在思考 ..." in statuses
+    # 进入第一轮流式前应发「正在处理」
+    assert "正在处理 ..." in statuses
     # 执行 web_search 前应发「正在搜索」
     assert "正在搜索 ..." in statuses
-    # 进入第二轮续写前应再发「正在思考」
-    assert statuses.count("正在思考 ...") >= 2
+    # 进入第二轮续写前应再发「正在处理」
+    assert statuses.count("正在处理 ...") >= 2
