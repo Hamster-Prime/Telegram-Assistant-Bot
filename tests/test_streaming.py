@@ -580,3 +580,22 @@ async def test_streaming_visible_content_eventually_complete(limiter):
     await r.finalize(full)
     assert bot.text_edits[-1][0] == full, (
         f"末次编辑不完整! 期望 {full!r},实际 {bot.text_edits[-1][0]!r}")
+
+
+# ── 状态行:工具文案映射 ─────────────────────────────────────
+
+def test_status_for_tool_classification():
+    """_status_for_tool 按语义分类映射工具名到状态文案。"""
+    from app.core.streaming import _status_for_tool
+    assert _status_for_tool("web_search") == "正在搜索 ..."
+    assert _status_for_tool("web_fetch") == "正在搜索 ..."
+    assert _status_for_tool("generate_image") == "正在生成 ..."
+    assert _status_for_tool("generate_video") == "正在生成 ..."
+    assert _status_for_tool("synthesize_speech") == "正在生成 ..."
+    assert _status_for_tool("generate_music") == "正在生成 ..."
+    assert _status_for_tool("save_memory") == "正在调用工具 ..."
+    assert _status_for_tool("search_memory") == "正在调用工具 ..."
+    assert _status_for_tool("get_current_time") == "正在调用工具 ..."
+    # 默认/未知工具
+    assert _status_for_tool("unknown_tool") == "正在调用工具 ..."
+    assert _status_for_tool("") == "正在调用工具 ..."

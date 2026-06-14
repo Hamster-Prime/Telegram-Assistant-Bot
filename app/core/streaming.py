@@ -58,6 +58,23 @@ _CURSOR = " ▌"  # 输入占位光标(已有内容时,作为后缀)
 _PLACEHOLDER_ON = "▌"   # 占位阶段(首条内容前)光标亮态
 _PLACEHOLDER_OFF = "\u00a0"  # 占位阶段光标灭态(不间断空格,Telegram 拒绝纯空编辑)
 
+# 状态行文案:按语义分类映射工具名(供 set_status 驱动)
+_SEARCH_TOOLS = frozenset({"web_search", "web_fetch"})
+_GENERATE_TOOLS = frozenset({
+    "generate_image", "generate_video", "synthesize_speech", "generate_music",
+})
+_STATUS_THINKING = "正在思考 ..."
+_STATUS_TOOL_DEFAULT = "正在调用工具 ..."
+
+
+def _status_for_tool(name: str) -> str:
+    """工具名 → 状态行文案(按语义分类)。未知工具归「正在调用工具」。"""
+    if name in _SEARCH_TOOLS:
+        return "正在搜索 ..."
+    if name in _GENERATE_TOOLS:
+        return "正在生成 ..."
+    return _STATUS_TOOL_DEFAULT
+
 
 def clip(text: str, limit: int = TG_MESSAGE_LIMIT) -> str:
     if len(text) <= limit:
