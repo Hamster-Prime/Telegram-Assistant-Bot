@@ -72,9 +72,11 @@ async def test_private_reply_text_folded_into_content():
     svc = make_svc()
     msg = make_private_message("继续解释", reply_text="第一条:量子力学")
     content, query = await fold_reply_context(svc, msg, "继续解释", "继续解释")
-    assert "[引用的消息]\n第一条:量子力学" in content
+    # 标记含发送者(Me);正文跟在标记后
+    assert "[引用的消息 · 👤 Me" in content
+    assert "第一条:量子力学" in content
     assert "[召唤者的问题]\n继续解释" in content
-    assert "[引用的消息]" in query
+    assert "[引用的消息" in query
 
 
 async def test_private_no_reply_unchanged():
@@ -94,7 +96,7 @@ async def test_private_reply_with_quote_uses_quote():
     content, query = await fold_reply_context(
         svc, msg, "这句什么意思", "这句什么意思")
     # reply_to_message 存在但无 quote 优先用 reply_text;此处 reply_text 非空
-    assert "[引用的消息]" in content
+    assert "[引用的消息" in content
 
 
 async def test_private_reply_photo_included_as_image():
@@ -132,4 +134,6 @@ async def test_group_reply_also_folded():
     msg = Message.model_validate(payload)
     svc = make_svc()
     content, query = await fold_reply_context(svc, msg, "总结下", "总结下")
-    assert "[引用的消息]\n原始讨论内容" in content
+    # 标记含发送者(O);正文跟在标记后
+    assert "[引用的消息 · 👤 O" in content
+    assert "原始讨论内容" in content

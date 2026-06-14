@@ -3,6 +3,9 @@
 Guest/私聊/群聊三场景共用。Guest 无历史,这是其唯一上下文来源;
 私聊虽有历史,但「回复/引用」是用户的强语义信号,必须显式带进 content,
 否则模型只能看到主消息文本,丢失用户意图(修复项)。
+
+标记含发送者 + 时间戳,让模型明确「谁在何时回复了什么」(对 Guest 尤其关键,
+是其唯一上下文)。
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from aiogram.types import Message
 from app.handlers.media import build_content
 from app.logging import get_logger
 from app.services import Services
+from app.utils.clock import format_timestamp
 
 log = get_logger("handlers.replies")
 
@@ -33,21 +37,58 @@ def _content_text(content: Any) -> str:
     )
 
 
+def _reply_sender_label(reply: Any) -> str:
+    """被回复消息的发送者显示名(用于标记;空字符串表示未知)。"""
+    rfu = getattr(reply, "from_user", None) or getattr(reply, "sender", None)
+    if rfu is None:
+        return ""
+    return getattr(rfu, "first_name", None) or getattr(rfu, "username", "") or ""
+
+
+def _reply_time_str(reply: Any) -> str:
+    """被回复消息的时间(秒级);无则返回空串。
+
+    aiogram 的 date 字段是 datetime 对象(非 unix int),用 .timestamp() 转换。
+    """
+    ts = getattr(reply, "date", None)
+    if ts is None:
+        return ""
+    try:
+        # aiogram: datetime 对象 → .timestamp();裸 int 直接用
+        epoch = ts.timestamp() if hasattr(ts, "timestamp") else int(ts)
+        return format_timestamp(int(epoch))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _build_reply_marker(reply: Any, reply_text: str) -> str:
+    """构造 [引用的消息 · 发送者 · 时间] 标记。sender/time 缺失时省略对应段。"""
+    parts = ["引用的消息"]
+    sender = _reply_sender_label(reply)
+    if sender:
+        parts.append(f"👤 {sender}")
+    ts = _reply_time_str(reply)
+    if ts:
+        parts.append(f"⏰ {ts}")
+    return "[" + " · ".join(parts) + "]"
+
+
 def _with_reply_context(
     content: Any,
     question_text: str,
     reply_content: Any | None,
     reply_text: str,
+    reply_marker: str,
 ) -> Any:
     """合并:引用消息(文本+媒体)+ 召唤者的问题(文本+媒体)。
 
-    文本上前置 [引用的消息] / [召唤者的问题] 两段标记;
+    文本上前置 {reply_marker} / [召唤者的问题] 两段标记;
     媒体块去重后追加(回复原文里的文本不重复拼)。
     """
     blocks: list[dict[str, Any]] = []
     text_parts: list[str] = []
     if reply_text:
-        text_parts.append(f"[引用的消息]\n{reply_text}")
+        text_parts.append(f"{reply_marker}\n{reply_text}")
 
     text_parts.append(f"[召唤者的问题]\n{question_text}")
     blocks.append({"type": "text", "text": "\n\n".join(text_parts)})
@@ -101,9 +142,11 @@ async def fold_reply_context(
     if reply_content is None and not reply_text:
         return content, query_text
 
-    new_content = _with_reply_context(content, query_text, reply_content, reply_text)
+    reply_marker = _build_reply_marker(reply, reply_text)
+    new_content = _with_reply_context(content, query_text, reply_content, reply_text,
+                                      reply_marker)
     if reply_text:
-        new_query = f"[引用的消息]\n{reply_text}\n\n[召唤者的问题]\n{query_text}"
+        new_query = f"{reply_marker}\n{reply_text}\n\n[召唤者的问题]\n{query_text}"
     else:
         new_query = f"[召唤者的问题]\n{query_text}"
     return new_content, new_query

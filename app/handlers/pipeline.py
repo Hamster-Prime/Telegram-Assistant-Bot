@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from aiogram.types import Message
@@ -10,6 +11,7 @@ from app.core.delivery import DirectDelivery, GuestDelivery, MediaDelivery
 from app.core.streaming import GuestRenderer, StreamRenderer
 from app.core.tools import ToolDispatcher
 from app.db.models import User
+from app.handlers.mentions import strip_bot_mention
 from app.logging import get_logger
 from app.search.router import AllProvidersFailed
 from app.services import Services
@@ -174,6 +176,55 @@ def build_dispatcher(
     return d
 
 
+def _extract_user_metadata(message: Message, bot_username: str) -> dict[str, Any]:
+    """从入站消息提取上下文元数据,用于持久化。
+
+    返回 {text, tg_message_id, reply_to_tg_id, reply_snapshot, sender_label}。
+    - text:已剥离 @bot 提及的干净正文(不含 fold_reply_context 的标记)
+    - reply_snapshot:被回复消息的「发送者: 正文」快照(≤200 字)
+    """
+    # 干净文本:剥离 bot 提及
+    raw = message.text or message.caption or ""
+    clean_text = strip_bot_mention(raw, bot_username) if raw else ""
+
+    # 发送者标签
+    fu = message.from_user
+    sender_label = ""
+    if fu:
+        sender_label = fu.first_name or fu.username or ""
+
+    # 回复元数据
+    reply_to_tg_id: int | None = None
+    reply_snapshot: str | None = None
+    reply_msg = message.reply_to_message or getattr(message, "external_reply", None)
+    if reply_msg is not None:
+        reply_to_tg_id = getattr(reply_msg, "message_id", None)
+        rfu = getattr(reply_msg, "from_user", None) or getattr(reply_msg, "sender", None)
+        r_sender = ""
+        if rfu is not None:
+            r_sender = (getattr(rfu, "first_name", None)
+                        or getattr(rfu, "username", "")
+                        or "")
+        r_text = (getattr(reply_msg, "text", None)
+                  or getattr(reply_msg, "caption", None)
+                  or "")[:150]
+        if r_sender or r_text:
+            reply_snapshot = f"{r_sender}: {r_text}".strip()[:200]
+        elif getattr(message, "quote", None):
+            # external_reply 场景:用户选中的引用片段兜底
+            q_text = getattr(message.quote, "text", "") or ""
+            if q_text:
+                reply_snapshot = q_text[:200]
+
+    return {
+        "text": clean_text or "(空消息)",
+        "tg_message_id": message.message_id,
+        "reply_to_tg_id": reply_to_tg_id,
+        "reply_snapshot": reply_snapshot,
+        "sender_label": sender_label,
+    }
+
+
 async def run_chat_pipeline(
     svc: Services,
     user: User,
@@ -184,10 +235,28 @@ async def run_chat_pipeline(
     scope: str = "user",
     query_text: str = "",
     persist: bool = True,
+    auto_clear: bool = False,
 ) -> None:
-    """统一对话管道:配额预检 → 并发槽 → 上下文 → Agent → 落库/结算/压缩/记忆。"""
+    """统一对话管道:配额预检 → 并发槽 → 上下文 → Agent → 落库/结算/压缩/记忆。
+
+    auto_clear:仅 Guest 启用 —— 进入管道前懒检查 30 分钟无活动则清空上下文,
+    实现 Guest 的「短期持续记忆 + 自动过期」语义。Private/Group 不启用,
+    由 compaction + /reset 管理上下文。
+    """
     chat_id = message.chat.id
     scope_owner = user.tg_id if scope == "user" else chat_id
+
+    # Guest(auto_clear=True):超时懒清空。空会话 last_activity 返回 None → 自动跳过,
+    # 不会反复执行。
+    if auto_clear and svc.settings.auto_clear_minutes > 0:
+        last_ts = await svc.daos.messages.last_activity(chat_id)
+        if last_ts is not None:
+            idle_s = int(time.time()) - last_ts
+            if idle_s > svc.settings.auto_clear_minutes * 60:
+                async with svc.user_lock.for_user(user.tg_id):
+                    await svc.daos.messages.clear_chat(chat_id)
+                log.info("Guest 超时自动清空上下文", 会话=chat_id,
+                         空闲分钟=idle_s // 60)
 
     # 配额预检(tokens 估算:本轮文本)
     est = max(64, estimate_tokens(query_text))
@@ -228,9 +297,18 @@ async def run_chat_pipeline(
 
     # ── 后处理(不阻塞用户) ────────────────────────────────
     if persist:
-        user_text = query_text if query_text else str(content)[:2000]
-        await svc.daos.messages.add(chat_id, user.tg_id, "user", user_text,
-                                    tokens=estimate_tokens(user_text))
+        # 提取元数据:干净正文 + 发送者 + 回复关系快照
+        me = await svc.bot.me()
+        meta = _extract_user_metadata(message, me.username or "")
+        user_text = meta["text"] if meta["text"] != "(空消息)" else query_text
+        await svc.daos.messages.add(
+            chat_id, user.tg_id, "user", user_text,
+            tokens=estimate_tokens(user_text),
+            tg_message_id=meta["tg_message_id"],
+            reply_to_tg_id=meta["reply_to_tg_id"],
+            reply_snapshot=meta["reply_snapshot"],
+            sender_label=meta["sender_label"],
+        )
         if result.text:
             await svc.daos.messages.add(chat_id, None, "assistant", result.text,
                                         tokens=estimate_tokens(result.text))

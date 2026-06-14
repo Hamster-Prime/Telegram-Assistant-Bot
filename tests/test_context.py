@@ -22,8 +22,13 @@ async def test_context_basic_structure(daos: DAOBundle):
     cb = ContextBuilder(daos)
     msgs = await cb.build(100, 1, "你好", query_text="你好")
     assert msgs[0]["role"] == "system"
-    assert "当前时间" in msgs[0]["content"]
-    assert msgs[-1] == {"role": "user", "content": "你好"}
+    # 系统提示已稳定:无实际渲染的时间戳(只有 [⏰ 当前时间: ...] 占位说明文字)
+    # 实际时间戳格式为 [⏰ 当前时间: 2026-...],这里检查冒号后跟数字
+    import re
+    assert not re.search(r"\[⏰ 当前时间: \d", msgs[0]["content"])
+    assert msgs[-1]["role"] == "user"
+    assert msgs[-1]["content"].startswith("你好")
+    assert re.search(r"\[⏰ 当前时间: \d", msgs[-1]["content"])
 
 
 async def test_system_prompt_requires_search_for_fresh_factual_questions(daos: DAOBundle):
@@ -71,7 +76,10 @@ async def test_context_includes_recent_messages(daos: DAOBundle):
     msgs = await cb.build(100, 1, "继续")
     roles = [m["role"] for m in msgs]
     assert roles == ["system", "user", "assistant", "user"]
-    assert msgs[1]["content"] == "第一句"
+    # 历史消息带元数据 header(时间 + 发送者),正文跟在 header 后
+    assert "[·" in msgs[1]["content"] or "·" in msgs[1]["content"]
+    assert msgs[1]["content"].endswith("第一句")
+    assert msgs[2]["content"].endswith("第一答")
 
 
 async def test_context_budget_trims_history(daos: DAOBundle):
@@ -83,6 +91,43 @@ async def test_context_budget_trims_history(daos: DAOBundle):
     assert len(msgs) < 10
 
 
+async def test_history_message_has_sender_and_timestamp(daos: DAOBundle):
+    """历史消息带 [时间 · 发送者] 元数据 header(上下文增强核心)。"""
+    await daos.messages.add(100, 1, "user", "你好", sender_label="Alice")
+    await daos.messages.add(100, None, "assistant", "你好呀")
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "继续")
+    # user 历史消息:header 含 Alice + 时间,正文为「你好」
+    user_hist = msgs[1]
+    assert user_hist["role"] == "user"
+    assert "👤 Alice" in user_hist["content"]
+    assert user_hist["content"].endswith("你好")
+    # assistant 历史消息:header 含 🤖 助理
+    asst_hist = msgs[2]
+    assert asst_hist["role"] == "assistant"
+    assert "🤖 助理" in asst_hist["content"]
+
+
+async def test_history_message_shows_reply_snapshot(daos: DAOBundle):
+    """被回复消息的快照出现在历史消息 header 的 ↩️ 行。"""
+    await daos.messages.add(
+        100, 1, "user", "继续解释", sender_label="Bob",
+        reply_snapshot="Alice: 量子力学基础",
+    )
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "新问题")
+    hist = msgs[1]
+    assert "↩️ 回复「Alice: 量子力学基础」" in hist["content"]
+
+
+async def test_system_prompt_is_stable_across_calls(daos: DAOBundle):
+    """系统提示无 {now},多次调用字节一致(prompt cache 友好)。"""
+    cb = ContextBuilder(daos)
+    msgs1 = await cb.build(100, 1, "第一问")
+    msgs2 = await cb.build(100, 1, "第二问")
+    assert msgs1[0]["content"] == msgs2[0]["content"]
+
+
 async def test_context_multimodal_content(daos: DAOBundle):
     content = [
         {"type": "text", "text": "这是什么"},
@@ -90,7 +135,16 @@ async def test_context_multimodal_content(daos: DAOBundle):
     ]
     cb = ContextBuilder(daos)
     msgs = await cb.build(100, 1, content, query_text="这是什么")
-    assert msgs[-1]["content"] == content
+    # 多模态 content 末尾追加时间戳 text 块
+    last = msgs[-1]
+    assert last["role"] == "user"
+    assert isinstance(last["content"], list)
+    # 原两个块保留
+    assert last["content"][0] == {"type": "text", "text": "这是什么"}
+    assert last["content"][1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}
+    # 末尾追加时间戳块
+    assert last["content"][-1]["type"] == "text"
+    assert "[⏰ 当前时间:" in last["content"][-1]["text"]
 
 
 class FakeChatAPI:

@@ -73,6 +73,10 @@ class MessageRow:
     tokens: int = 0
     compacted: int = 0
     created_at: int | None = None
+    tg_message_id: int | None = None
+    reply_to_tg_id: int | None = None
+    reply_snapshot: str | None = None
+    sender_label: str | None = None
 
 
 @dataclass(slots=True)

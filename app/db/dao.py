@@ -174,11 +174,18 @@ class MessageDAO:
         self.db = db
 
     async def add(self, chat_id: int, user_id: int | None, role: str, content: str,
-                  content_type: str = "text", tokens: int = 0) -> int:
+                  content_type: str = "text", tokens: int = 0, *,
+                  tg_message_id: int | None = None,
+                  reply_to_tg_id: int | None = None,
+                  reply_snapshot: str | None = None,
+                  sender_label: str | None = None) -> int:
         return await self.db.execute(
-            """INSERT INTO messages (chat_id, user_id, role, content, content_type, tokens, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (chat_id, user_id, role, content, content_type, tokens, _now()),
+            """INSERT INTO messages
+               (chat_id, user_id, role, content, content_type, tokens, created_at,
+                tg_message_id, reply_to_tg_id, reply_snapshot, sender_label)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (chat_id, user_id, role, content, content_type, tokens, _now(),
+             tg_message_id, reply_to_tg_id, reply_snapshot, sender_label),
         )
 
     async def recent_uncompacted(self, chat_id: int, limit: int = 50) -> list[MessageRow]:
@@ -192,6 +199,17 @@ class MessageDAO:
         await self.db.execute(
             "UPDATE messages SET compacted=1 WHERE chat_id=? AND id<=?", (chat_id, up_to_id)
         )
+
+    async def last_activity(self, chat_id: int) -> int | None:
+        """该会话最近一条消息的 created_at(Unix 秒);无消息返回 None。
+
+        用于 Guest 30 分钟自动清空的懒检查:有消息才比时间,空会话直接跳过。
+        """
+        row = await self.db.fetch_one(
+            "SELECT created_at FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (chat_id,),
+        )
+        return row["created_at"] if row else None
 
     async def clear_chat(self, chat_id: int) -> None:
         await self.db.execute_many([

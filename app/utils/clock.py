@@ -23,3 +23,13 @@ def format_now(tz: str = DEFAULT_TZ) -> str:
         f"{dt.strftime('%Y-%m-%d %H:%M:%S')}"
         f"({_WEEKDAY_ZH[dt.weekday()]}, {tz}, UTC{sign}{abs(hours)})"
     )
+
+
+def format_timestamp(ts: int, tz: str = DEFAULT_TZ) -> str:
+    """Unix 秒 → '2026-06-13 14:30:00(周六)'。
+
+    用于历史消息元数据头部(秒级精度,与数据库 created_at 一致)。
+    """
+    from datetime import datetime
+    dt = datetime.fromtimestamp(ts, ZoneInfo(tz))
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')}({_WEEKDAY_ZH[dt.weekday()]})"

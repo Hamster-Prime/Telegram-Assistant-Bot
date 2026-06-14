@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     # ── 行为 / 存储 ────────────────────────────────────────────
     default_token_budget: int = 128_000
     compact_trigger_ratio: float = 0.6
+    # Guest 上下文自动清空:Guest 召唤超过此分钟数无活动时,下次进入管道先清空。
+    # 0 = 禁用。Private/Group 不受影响(由 compaction + /reset 管理)。
+    auto_clear_minutes: int = 30
     # 编辑节流(按场景,贴近 Telegram 硬限避免 429):
     #   单聊/Guest inline ≤1 条/秒 → EDIT_THROTTLE_MS=1000
     #   群聊 ≤20 条/分钟 ≈3 秒/次 → GROUP_EDIT_THROTTLE_MS=3000

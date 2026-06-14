@@ -167,7 +167,9 @@ async def test_guest_strips_bot_mention_only_from_question_not_reply(monkeypatch
 
     await guest.process_guest_message(message, user, svc)
 
-    assert "[引用的消息]\n@my_bot 原文里提到了机器人用户名" in captured["content"]
+    # 标记含发送者(R);正文跟在标记后
+    assert "[引用的消息 · 👤 R" in captured["content"]
+    assert "@my_bot 原文里提到了机器人用户名" in captured["content"]
     assert "[召唤者的问题]\n回复 @bob" in captured["content"]
 
 
@@ -236,12 +238,12 @@ async def test_guest_reply_text_preserved_and_current_photo_included(monkeypatch
 
     await guest.process_guest_message(message, user, svc)
 
-    assert captured["content"][0]["text"].startswith(
-        "[引用的消息]\n@my_bot 原消息里的用户名不要删"
-    )
+    # 标记含发送者(R);正文跟在标记后
+    assert captured["content"][0]["text"].startswith("[引用的消息 · 👤 R")
+    assert "@my_bot 原消息里的用户名不要删" in captured["content"][0]["text"]
     assert "[召唤者的问题]\n看看这个" in captured["content"][0]["text"]
     assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
-    assert captured["query_text"].startswith("[引用的消息]\n@my_bot 原消息里的用户名不要删")
+    assert "[引用的消息" in captured["query_text"]
 
 
 async def test_guest_video_message_is_ignored(monkeypatch):
@@ -342,12 +344,12 @@ async def test_guest_preserves_replied_photo_caption_and_includes_photo(monkeypa
 
     await guest.process_guest_message(message, user, svc)
 
-    assert captured["content"][0]["text"].startswith(
-        "[引用的消息]\n@my_bot 原图说明不要删"
-    )
+    # 标记含发送者(R);正文跟在标记后
+    assert captured["content"][0]["text"].startswith("[引用的消息 · 👤 R")
+    assert "@my_bot 原图说明不要删" in captured["content"][0]["text"]
     assert "[召唤者的问题]\n描述一下" in captured["content"][0]["text"]
     assert image_urls(captured["content"])[0].startswith("data:image/jpeg;base64,")
-    assert captured["query_text"].startswith("[引用的消息]\n@my_bot 原图说明不要删")
+    assert "[引用的消息" in captured["query_text"]
     assert svc.bot.downloaded_file_ids == ["reply-photo-2"]
 
 

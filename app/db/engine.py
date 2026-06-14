@@ -68,6 +68,7 @@ class Database:
         schema = _SCHEMA_PATH.read_text(encoding="utf-8")
         await self._conn.executescript(schema)
         await self._migrate_generations_inline()
+        await self._migrate_messages_metadata()
         await self._conn.commit()
         # 独立只读连接(读不抢写锁、不进写事务)
         self._read_conn = await aiosqlite.connect(dsn, uri=self._uri)
@@ -83,6 +84,22 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE generations ADD COLUMN inline_message_id TEXT")
             log.info("已迁移:generations 增加 inline_message_id 列")
+
+    async def _migrate_messages_metadata(self) -> None:
+        """老库 messages 表补列:上下文元数据(tg_message_id/reply_to_tg_id/
+        reply_snapshot/sender_label)。幂等:逐列检查再 ADD COLUMN。"""
+        async with self.conn.execute("PRAGMA table_info(messages)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        for col, decl in (
+            ("tg_message_id", "INTEGER"),
+            ("reply_to_tg_id", "INTEGER"),
+            ("reply_snapshot", "TEXT"),
+            ("sender_label", "TEXT"),
+        ):
+            if col not in cols:
+                await self.conn.execute(
+                    f"ALTER TABLE messages ADD COLUMN {col} {decl}")
+                log.info("已迁移:messages 增加 %s 列", col)
 
     async def close(self) -> None:
         if self._read_conn is not None:

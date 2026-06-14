@@ -40,11 +40,19 @@ CREATE TABLE IF NOT EXISTS chats (
 );
 
 -- 对话原始消息(压缩前)
+-- tg_message_id:Telegram 消息 id(关联回复链)
+-- reply_to_tg_id:被回复消息的 Telegram 消息 id
+-- reply_snapshot:被回复消息的内容快照(发送者:正文,截断 ~200 字)
+-- sender_label:发送者显示名(群聊多用户区分用;assistant 留空 → 渲染为助理)
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id INTEGER, user_id INTEGER,
   role TEXT, content TEXT, content_type TEXT DEFAULT 'text',
-  tokens INTEGER DEFAULT 0, compacted INTEGER DEFAULT 0, created_at INTEGER
+  tokens INTEGER DEFAULT 0, compacted INTEGER DEFAULT 0, created_at INTEGER,
+  tg_message_id INTEGER,
+  reply_to_tg_id INTEGER,
+  reply_snapshot TEXT,
+  sender_label TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, id);
 
