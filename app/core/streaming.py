@@ -104,6 +104,13 @@ class StreamRenderer(Protocol):
         """定稿;返回最终 message_id(可得时)。"""
         ...
 
+    async def set_status(self, status: str) -> None:
+        """设置当前状态行文案(如「正在思考 ...」)。
+
+        仅暂存,不直接发编辑;由轮询循环在下次 tick 合并到正文后缀渲染。
+        """
+        ...
+
     async def fail(self, error_text: str) -> None: ...
 
     @property
@@ -351,6 +358,7 @@ class _TickLoopMixin:
     _pending: str | None
     _committed: str
     _cursor_on: bool
+    _status: str
     _last_edit_time: float
 
     def _tick_init(self, interval_s: float) -> None:
@@ -360,7 +368,12 @@ class _TickLoopMixin:
         self._pending = None
         self._committed = ""
         self._cursor_on = True
+        self._status = "正在思考 ..."
         self._last_edit_time = 0.0
+
+    async def set_status(self, status: str) -> None:
+        """仅暂存状态文案;下次 tick 合并渲染(与 update 同为非阻塞暂存)。"""
+        self._status = status
 
     async def _ensure_interval_elapsed(self) -> None:
         """距上次编辑不足 interval 时 sleep 补齐(咽喉点门控,防 429)。
@@ -389,15 +402,13 @@ class _TickLoopMixin:
         try:
             while not self._stop.is_set():
                 if self._pending is not None and self._pending != self._committed:
-                    # ① 内容写入:不带光标;预设下次 idle 闪烁为亮
+                    # ① 内容写入:正文 + 空行 + 状态行
                     text = self._pending
                     self._committed = self._pending
                     self._on_committed(self._pending)
                     self._pending = None
-                    self._cursor_on = False  # 下次 idle toggle → True(亮)
-                    suffix = ""
                     try:
-                        await do_edit(text + suffix)
+                        await do_edit(text + "\n\n<i>" + self._status + "</i>")
                     except Exception as e:
                         log.warning("轮询编辑失败(忽略)", 错误=str(e)[:120])
                 elif self._committed:

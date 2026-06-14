@@ -599,3 +599,22 @@ def test_status_for_tool_classification():
     # 默认/未知工具
     assert _status_for_tool("unknown_tool") == "正在调用工具 ..."
     assert _status_for_tool("") == "正在调用工具 ..."
+
+
+# ── 状态行:set_status 驱动 ──────────────────────────────────
+
+async def test_set_status_drives_status_line(limiter):
+    """set_status 暂存状态,下次 tick 落地的编辑含该状态行。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    await r.set_status("正在搜索 ...")
+    await r.update("正文内容")
+    await asyncio.sleep(0.03)  # 让 tick 落地
+    # 内容写入编辑应同时含正文与状态行(后续 idle 闪烁不带状态行)
+    assert bot.text_edits, "应有编辑落地"
+    content_edits = [e[0] for e in bot.text_edits
+                     if "正文内容" in e[0] and "正在搜索 ..." in e[0]]
+    assert content_edits, "应有一次带状态行的内容写入编辑"
+    await r.finalize("正文内容完成")
