@@ -25,6 +25,7 @@ from app.minimax.video import VideoAPI
 from app.search.brave import BraveProvider
 from app.search.duckduckgo import DuckDuckGoProvider
 from app.search.firecrawl import FirecrawlProvider
+from app.search.minimax import MiniMaxSearchProvider
 from app.search.router import SearchRouter
 
 log = get_logger("services")
@@ -80,6 +81,11 @@ class Services:
                     self.search_http, settings.brave_api_key, settings.brave_timeout_s))
             elif name == "duckduckgo":
                 providers.append(DuckDuckGoProvider(settings.ddg_timeout_s))
+            elif name == "minimax":
+                # 复用全部 MiniMax Key(Token Plan 订阅),多 Key fallback
+                providers.append(MiniMaxSearchProvider(
+                    self.search_http, settings.minimax_keys,
+                    settings.minimax_base_url, settings.minimax_search_timeout_s))
         self.search = SearchRouter(providers, self.search_http)
 
         # 上层服务

@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from app.search.base import ProviderError, SearchResult
+from app.search.minimax import MiniMaxSearchProvider
 from app.search.router import AllProvidersFailed, SearchRouter, _html_to_text
 
 
@@ -122,3 +123,203 @@ def test_html_to_text_strips_script():
     html = "<html><script>evil()</script><body><p>你好 世界</p></body></html>"
     text = _html_to_text(html)
     assert "你好" in text and "evil" not in text
+
+
+# ── MiniMaxSearchProvider 单元测试 ─────────────────────────
+
+
+def _mmx_http(handler):
+    """构造带 MockTransport 的 httpx client,路由到 handler。"""
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _mmx_ok_body(items: list[dict]) -> dict:
+    return {"organic": items, "base_resp": {"status_code": 0, "status_msg": "success"}}
+
+
+async def test_minimax_search_maps_organic_to_search_result():
+    body = _mmx_ok_body([
+        {"title": "标题A", "link": "https://a.com", "snippet": "摘要A", "date": "2025-01-01"},
+        {"title": "标题B", "link": "https://b.com", "snippet": "摘要B"},
+    ])
+    http = _mmx_http(lambda req: httpx.Response(200, json=body))
+    p = MiniMaxSearchProvider(http, "test-key")
+    res = await p.search("测试", count=5)
+    assert len(res) == 2
+    assert res[0] == {"title": "标题A", "url": "https://a.com",
+                      "snippet": "摘要A", "source": "minimax"}
+    assert res[1]["url"] == "https://b.com"
+
+
+async def test_minimax_search_truncates_to_count():
+    items = [{"title": f"T{i}", "link": f"https://x{i}.com", "snippet": "s"} for i in range(8)]
+    http = _mmx_http(lambda req: httpx.Response(200, json=_mmx_ok_body(items)))
+    p = MiniMaxSearchProvider(http, "test-key")
+    res = await p.search("测试", count=3)
+    assert len(res) == 3
+
+
+async def test_minimax_search_empty_organic():
+    http = _mmx_http(lambda req: httpx.Response(200, json=_mmx_ok_body([])))
+    p = MiniMaxSearchProvider(http, "test-key")
+    res = await p.search("测试", count=5)
+    assert res == []
+
+
+async def test_minimax_search_base_resp_error_raises():
+    body = {"organic": [], "base_resp": {"status_code": 1004, "status_msg": "鉴权失败"}}
+    http = _mmx_http(lambda req: httpx.Response(200, json=body))
+    p = MiniMaxSearchProvider(http, "test-key")
+    with pytest.raises(ProviderError, match="code=1004"):
+        await p.search("测试", count=5)
+
+
+async def test_minimax_search_auth_failure_raises():
+    http = _mmx_http(lambda req: httpx.Response(401))
+    p = MiniMaxSearchProvider(http, "test-key")
+    with pytest.raises(ProviderError, match="鉴权失败"):
+        await p.search("测试", count=5)
+
+
+async def test_minimax_search_posts_correct_body():
+    captured = {}
+
+    def handler(req: httpx.Request):
+        captured["url"] = str(req.url)
+        captured["auth"] = req.headers.get("authorization", "")
+        captured["body"] = req.content.decode()
+        return httpx.Response(200, json=_mmx_ok_body([]))
+
+    http = _mmx_http(handler)
+    p = MiniMaxSearchProvider(http, "sk-test", "https://api.minimaxi.com/v1")
+    await p.search("你好世界", count=5)
+    assert captured["url"] == "https://api.minimaxi.com/v1/coding_plan/search"
+    assert captured["auth"] == "Bearer sk-test"
+    assert '"q"' in captured["body"] and "你好世界" in captured["body"]
+
+
+async def test_minimax_unavailable_without_key():
+    http = _mmx_http(lambda req: httpx.Response(200, json=_mmx_ok_body([])))
+    p = MiniMaxSearchProvider(http, "")
+    assert p.available is False
+    with pytest.raises(ProviderError, match="未配置"):
+        await p.search("测试", count=5)
+
+
+async def test_minimax_fetch_returns_none():
+    http = _mmx_http(lambda req: httpx.Response(200))
+    p = MiniMaxSearchProvider(http, "test-key")
+    assert await p.fetch("https://example.com") is None
+
+
+async def test_minimax_router_integration_first_choice():
+    """router 中 minimax 命中后不调用后续 provider。"""
+    body = _mmx_ok_body([
+        {"title": "结果", "link": "https://r.com", "snippet": "s"}])
+    http = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json=body)))
+    minimax = MiniMaxSearchProvider(http, "test-key")
+    fallback = FakeProvider("firecrawl", results=hit("firecrawl"))
+    router = SearchRouter([minimax, fallback], http)
+    res = await router.search("查询")
+    assert res[0]["source"] == "minimax"
+    assert fallback.search_calls == 0
+
+
+# ── MiniMaxSearchProvider 多 Key fallback 测试 ─────────────
+
+
+def _mmx_ok_item(title="结果", url="https://r.com", snippet="s"):
+    return {"title": title, "link": url, "snippet": snippet}
+
+
+async def test_minimax_first_key_401_falls_to_second_key():
+    """Key#1 鉴权失败(401)→ 切换 Key#2 命中。"""
+    calls = []
+
+    def handler(req: httpx.Request):
+        auth = req.headers.get("authorization", "")
+        calls.append(auth)
+        if auth == "Bearer bad-key":
+            return httpx.Response(401)
+        return httpx.Response(200, json=_mmx_ok_body([_mmx_ok_item()]))
+
+    http = _mmx_http(handler)
+    p = MiniMaxSearchProvider(http, ["bad-key", "good-key"])
+    res = await p.search("测试", count=5)
+    assert res[0]["source"] == "minimax"
+    assert len(calls) == 2
+    assert calls[1] == "Bearer good-key"
+
+
+async def test_minimax_first_key_429_falls_to_second_key():
+    """Key#1 限流(429)→ 切换 Key#2 命中。"""
+    def handler(req: httpx.Request):
+        auth = req.headers.get("authorization", "")
+        if auth == "Bearer k1":
+            return httpx.Response(429)
+        return httpx.Response(200, json=_mmx_ok_body([_mmx_ok_item()]))
+
+    http = _mmx_http(handler)
+    p = MiniMaxSearchProvider(http, ["k1", "k2"])
+    res = await p.search("测试", count=5)
+    assert len(res) == 1
+
+
+async def test_minimax_first_key_base_resp_auth_falls_to_second_key():
+    """Key#1 base_resp 鉴权失败(1004)→ 切换 Key#2 命中。"""
+    def handler(req: httpx.Request):
+        auth = req.headers.get("authorization", "")
+        if auth == "Bearer k1":
+            return httpx.Response(200, json={
+                "organic": [],
+                "base_resp": {"status_code": 1004, "status_msg": "鉴权失败"}})
+        return httpx.Response(200, json=_mmx_ok_body([_mmx_ok_item()]))
+
+    http = _mmx_http(handler)
+    p = MiniMaxSearchProvider(http, ["k1", "k2"])
+    res = await p.search("测试", count=5)
+    assert len(res) == 1
+
+
+async def test_minimax_all_keys_fail_raises_with_detail():
+    """所有 Key 均 401 → ProviderError 含失败明细。"""
+    http = _mmx_http(lambda req: httpx.Response(401))
+    p = MiniMaxSearchProvider(http, ["k1", "k2", "k3"])
+    with pytest.raises(ProviderError, match="3 个 MiniMax Key"):
+        await p.search("测试", count=5)
+
+
+async def test_minimax_request_level_error_skips_other_keys():
+    """请求级错误(1026)→ 立即抛出,不消耗其余 Key。"""
+    calls = []
+
+    def handler(req: httpx.Request):
+        calls.append(req.headers.get("authorization", ""))
+        return httpx.Response(200, json={
+            "organic": [],
+            "base_resp": {"status_code": 1026, "status_msg": "内容涉及敏感信息"}})
+
+    http = _mmx_http(handler)
+    p = MiniMaxSearchProvider(http, ["k1", "k2", "k3"])
+    with pytest.raises(ProviderError, match="code=1026"):
+        await p.search("测试", count=5)
+    assert len(calls) == 1  # 只试了第一个 Key
+
+
+async def test_minimax_accepts_single_string_key():
+    """传单个 str Key(向后兼容)→ 正常工作。"""
+    http = _mmx_http(lambda req: httpx.Response(200, json=_mmx_ok_body([_mmx_ok_item()])))
+    p = MiniMaxSearchProvider(http, "only-key")
+    assert p.available is True
+    res = await p.search("测试", count=5)
+    assert len(res) == 1
+
+
+async def test_minimax_empty_keys_filtered():
+    """Key 列表含空串 → 过滤后若无有效 Key 则不可用。"""
+    http = _mmx_http(lambda req: httpx.Response(200))
+    p = MiniMaxSearchProvider(http, ["", "  ", ""])
+    assert p.available is False
+    with pytest.raises(ProviderError, match="未配置"):
+        await p.search("测试", count=5)

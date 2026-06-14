@@ -43,11 +43,13 @@ class Settings(BaseSettings):
     model_music: str = "music-2.6"
 
     # ── 搜索 / 抓取 ────────────────────────────────────────────
+    # MiniMax 搜索复用 MINIMAX_API_KEYS 首个 Key(Token Plan 订阅)
     firecrawl_api_key: str = ""
     brave_api_key: str = ""
-    search_order: str = "firecrawl,brave,duckduckgo"
+    search_order: str = "minimax,firecrawl,brave,duckduckgo"
     search_result_count: int = 5
     search_retry: int = 1
+    minimax_search_timeout_s: float = 15.0
     firecrawl_timeout_s: float = 15.0
     brave_timeout_s: float = 8.0
     ddg_timeout_s: float = 8.0
