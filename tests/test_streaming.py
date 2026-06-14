@@ -649,3 +649,25 @@ async def test_draft_set_status_is_noop(limiter):
     await r.update("草稿内容")
     await r.finalize("草稿内容完成")
     assert bot.sent[-1][1] == "草稿内容完成"
+
+
+async def test_set_status_after_content_renders_body_plus_status(limiter):
+    """正文已落地后调 set_status:立即渲染「正文+新状态行」,不改动 _committed。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    await r.update("第一轮正文")
+    await asyncio.sleep(0.03)  # 让内容写入落地(_committed="第一轮正文")
+    n_before = len(bot.text_edits)
+    # 模拟工具阶段:set_status 主动渲染新状态行
+    await r.set_status("正在搜索 ...")
+    # 应新增一次编辑,内容为「正文 + 新状态行」
+    new_edits = bot.text_edits[n_before:]
+    assert len(new_edits) >= 1, "set_status 应主动发一次编辑"
+    assert "第一轮正文" in new_edits[-1][0]
+    assert "正在搜索 ..." in new_edits[-1][0]
+    assert "正在思考" not in new_edits[-1][0]  # 旧状态已被替换
+    # _committed 不应被 set_status 改动
+    assert r._committed == "第一轮正文"
+    await r.finalize("第一轮正文完成")

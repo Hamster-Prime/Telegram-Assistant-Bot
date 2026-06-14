@@ -383,12 +383,24 @@ class _TickLoopMixin:
         """
         self._status = status
         if self._committed:
-            rendered = self._committed + "\n\n<i>" + self._status + "</i>"
+            rendered = self._render_body_with_status(self._committed)
         else:
-            rendered = "<i>" + self._status + "</i>"
+            rendered = self._render_status_placeholder()
             # 同步去重缓存:占位状态主动渲染后,占位分支 tick 不应立即重复
             self._last_placeholder_render = rendered
-        await self._raw_edit(rendered)
+        try:
+            await self._raw_edit(rendered)
+        except Exception as e:
+            # 状态行仅作显示,任何渲染异常都不得中断 Agent 主循环
+            log.warning("状态行渲染失败(忽略)", 错误=str(e)[:120])
+
+    def _render_body_with_status(self, body: str) -> str:
+        """正文 + 空行 + 斜体状态行(内容写入与 set_status 共用)。"""
+        return body + "\n\n<i>" + self._status + "</i>"
+
+    def _render_status_placeholder(self) -> str:
+        """纯状态行(占位阶段)。"""
+        return "<i>" + self._status + "</i>"
 
     async def _ensure_interval_elapsed(self) -> None:
         """距上次编辑不足 interval 时 sleep 补齐(咽喉点门控,防 429)。
@@ -422,7 +434,7 @@ class _TickLoopMixin:
                     self._on_committed(self._pending)
                     self._pending = None
                     try:
-                        await do_edit(text + "\n\n<i>" + self._status + "</i>")
+                        await do_edit(self._render_body_with_status(text))
                     except Exception as e:
                         log.warning("轮询编辑失败(忽略)", 错误=str(e)[:120])
                 elif self._committed:
@@ -432,7 +444,7 @@ class _TickLoopMixin:
                     pass
                 else:
                     # ③ 占位阶段(首条内容前):渲染纯状态行;状态未变则不重复编辑
-                    rendered = "<i>" + self._status + "</i>"
+                    rendered = self._render_status_placeholder()
                     if rendered == self._last_placeholder_render:
                         pass  # 状态行未变,跳过编辑(避免 "not modified" 空转)
                     else:
