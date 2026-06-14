@@ -350,8 +350,9 @@ class _TickLoopMixin:
 
         _do_edit 在 limiter.acquire() 前调用本方法(先补齐再取全局令牌,避免
         sleep 期间阻塞其它会话的发送)。tick 稳态下 elapsed 已 ≥ interval,直接
-        返回零开销;仅在 finalize 立即取消 tick 后编辑、或 start 后首次编辑时补齐,
-        保证「同一消息任意两次 edit 距离 ≥ interval」。
+        返回零开销;仅在 finalize 紧随末次 tick 编辑时补齐,保证「同一消息任意两次
+        edit 距离 ≥ interval」。首次编辑(_last_edit_time=0)不门控:send 与 edit 是
+        不同速率桶,首条内容应立即可见。
         """
         if self._last_edit_time > 0:
             gap = self._interval_s - (time.monotonic() - self._last_edit_time)
@@ -476,8 +477,6 @@ class EditRenderer(_TickLoopMixin):
                 break
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
-        # 占位 send 也计入时间戳:首个闪烁 edit 距 send ≥ interval,避免 send+edit<1s 触发 429
-        self._last_edit_time = time.monotonic()
         # 群聊:全程 typing 直到 finalize
         self._typing_stop = asyncio.Event()
         self._typing_task = asyncio.create_task(
@@ -621,8 +620,6 @@ class GuestRenderer(_TickLoopMixin):
             log.error("answerGuestQuery失败", 查询ID=self._guest_query_id,
                       错误=str(e)[:200])
             raise
-        # answerGuestQuery(即首条 inline 消息)也计入时间戳:首个闪烁 edit 距其 ≥ interval
-        self._last_edit_time = time.monotonic()
         # 启动统一轮询循环(内容更新 + 闪烁共用间隔)
         self._tick_task = asyncio.create_task(
             self._tick_loop(self._raw_edit))

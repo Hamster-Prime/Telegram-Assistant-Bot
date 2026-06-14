@@ -518,3 +518,65 @@ async def test_guest_renderer_does_not_send_typing(limiter):
     await r.start()
     # GuestFakeBot 无 send_chat_action;若调用会 AttributeError,但 Guest 不调
     await r.finalize("Guest回复")
+
+
+# ── 真实节流参数下的完整性回归(排查「定稿截断」)─────────────
+
+async def test_realistic_guest_stream_lands_complete_text(limiter):
+    """真实 Guest 节流(1000ms):多次 update 后 finalize,末次编辑须为完整文本。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1000)
+    await r.start()
+    full = "你好,这是一段足够长的完整回复文本,用于验证定稿不被截断。"
+    # 模拟流式:逐步投递前缀
+    for i in range(1, len(full), 5):
+        await r.update(full[:i])
+    await r.finalize(full)
+    # 核心断言:末次落地编辑必须是完整文本
+    assert bot.text_edits[-1][0] == full, (
+        f"末次编辑被截断! 期望 {len(full)} 字,实际 {len(bot.text_edits[-1][0])} 字")
+    assert r.last_rendered_text == full
+
+
+async def test_realistic_group_stream_lands_complete_text(limiter):
+    """真实群聊节流(3000ms):update 被 tick 节流跳过,finalize 仍落地完整文本。"""
+    bot = FakeBot()
+    r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=3000,
+                     typing_refresh_s=10)
+    await r.start()
+    full = "这是一段在群聊场景下的完整回复,验证 3 秒节流不会导致定稿截断。"
+    for i in range(1, len(full), 4):
+        await r.update(full[:i])
+        await asyncio.sleep(0.001)
+    await r.finalize(full)
+    assert bot.edits[-1][2] == full, (
+        f"末次编辑被截断! 期望完整文本,实际: {bot.edits[-1][2]!r}")
+    assert r.last_rendered_text == full
+
+
+async def test_fast_response_finalize_complete(limiter):
+    """快速响应:start 后立刻 finalize(无中间 update),完整文本须落地。"""
+    bot = FakeBot()
+    r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1000,
+                     typing_refresh_s=10)
+    await r.start()
+    full = "快速回复的完整内容。"
+    await r.finalize(full)
+    assert bot.edits[-1][2] == full
+    assert r.last_rendered_text == full
+
+
+async def test_streaming_visible_content_eventually_complete(limiter):
+    """端到端:tick 提交中间内容后,finalize 落地完整文本(末次编辑=完整)。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=50)
+    await r.start()
+    await r.update("开头部分")
+    await asyncio.sleep(0.12)  # 让 tick 提交中间内容
+    assert len(bot.text_edits) >= 1, "tick 应已提交中间内容"
+    full = "开头部分,这里是流式追加的后续完整结尾文本。"
+    await r.finalize(full)
+    assert bot.text_edits[-1][0] == full, (
+        f"末次编辑不完整! 期望 {full!r},实际 {bot.text_edits[-1][0]!r}")
