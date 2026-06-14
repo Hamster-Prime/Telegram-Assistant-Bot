@@ -102,9 +102,10 @@ class StreamRenderer(Protocol):
         ...
 
     async def set_status(self, status: str) -> None:
-        """设置当前状态行文案(如「正在思考 ...」)。
+        """设置当前状态行文案(如「正在思考 ...」)并立即渲染。
 
-        仅暂存,不直接发编辑;由轮询循环在下次 tick 合并到正文后缀渲染。
+        主动发一次编辑:正文已落地则渲染「正文+状态行」,占位阶段则渲染纯状态行。
+        走与轮询循环相同的间隔门控(429 安全)。DraftRenderer 是 no-op(无后缀概念)。
         """
         ...
 
@@ -373,13 +374,21 @@ class _TickLoopMixin:
         self._last_edit_time = 0.0
 
     async def set_status(self, status: str) -> None:
-        """仅暂存状态文案;下次 tick 合并渲染(与 update 同为非阻塞暂存)。
+        """设置状态行文案,并立即渲染当前状态(正文+状态行,或纯占位状态行)。
 
-        渲染时机:状态行的实际刷新发生在①内容写入或③占位分支的下次 tick。
-        若在②idle 期(已有正文、暂无新内容)调用,状态不会立即显示,须等到
-        下一次 update() 触发内容写入 —— 故调用方宜在每段正文流式开始前设置状态。
+        立即渲染的理由:多轮工具调用中,Round1 正文已落地(_committed 非空),
+        进入 idle 后若仅暂存,新状态(如「正在搜索」)要到下一段正文流式才会
+        显示 —— 用户会在整个工具执行期看到旧状态。故 set_status 主动发一次编辑,
+        使状态切换即时可见。编辑走 _raw_edit(受 interval 门控,429 安全)。
         """
         self._status = status
+        if self._committed:
+            rendered = self._committed + "\n\n<i>" + self._status + "</i>"
+        else:
+            rendered = "<i>" + self._status + "</i>"
+            # 同步去重缓存:占位状态主动渲染后,占位分支 tick 不应立即重复
+            self._last_placeholder_render = rendered
+        await self._raw_edit(rendered)
 
     async def _ensure_interval_elapsed(self) -> None:
         """距上次编辑不足 interval 时 sleep 补齐(咽喉点门控,防 429)。

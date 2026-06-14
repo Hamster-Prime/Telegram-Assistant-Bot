@@ -15,6 +15,10 @@ class FakeRenderer:
 
     async def start(self): ...
 
+    async def set_status(self, status: str):
+        self.statuses = getattr(self, "statuses", [])
+        self.statuses.append(status)
+
     async def update(self, t: str):
         self.updates.append(t)
 
@@ -240,3 +244,30 @@ async def test_multiple_tool_rounds_overwrite_display():
     assert result.text == "好了"
     assert r.final == "好了"
     assert result.tool_rounds == 2
+
+
+async def test_agent_sets_status_on_tool_phase():
+    """Agent 在思考/工具/续写节点驱动状态行切换。"""
+    chat = ScriptedChat([
+        [  # 第一轮:发起搜索工具
+            ChatStreamEvent(kind="tool_calls", finish_reason="tool_calls",
+                            tool_calls=[ToolCallDelta(id="c1", name="web_search",
+                                                      arguments='{"query":"x"}')]),
+            ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [  # 第二轮:基于结果回答
+            ChatStreamEvent(kind="content", text="搜到结果"),
+            ChatStreamEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    agent = Agent(chat)
+    r = FakeRenderer()
+    await agent.run([{"role": "user", "content": "搜一下"}], r, ToolDispatcher())
+
+    statuses = getattr(r, "statuses", [])
+    # 进入第一轮流式前应发「正在思考」
+    assert "正在思考 ..." in statuses
+    # 执行 web_search 前应发「正在搜索」
+    assert "正在搜索 ..." in statuses
+    # 进入第二轮续写前应再发「正在思考」
+    assert statuses.count("正在思考 ...") >= 2
