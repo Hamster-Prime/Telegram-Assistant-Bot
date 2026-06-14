@@ -381,6 +381,9 @@ class _TickLoopMixin:
         显示 —— 用户会在整个工具执行期看到旧状态。故 set_status 主动发一次编辑,
         使状态切换即时可见。编辑走 _raw_edit(受 interval 门控,429 安全)。
         """
+        # 状态未变且尚无正文(占位阶段)→ 消息已显示该状态,跳过冗余编辑
+        if status == self._status and not self._committed:
+            return
         self._status = status
         if self._committed:
             rendered = self._render_body_with_status(self._committed)

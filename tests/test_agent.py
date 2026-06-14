@@ -1,10 +1,19 @@
 """Agent 主循环测试 —— 工具调用回灌、流式事件、错误兜底。"""
 from __future__ import annotations
 
+import pytest
+
 from app.core.agent import Agent
+from app.core.concurrency import SendRateLimiter
+from app.core.streaming import GuestRenderer
 from app.core.tools import ToolDispatcher
 from app.minimax.chat import ChatStreamEvent, ToolCallDelta
 from app.minimax.client import AllKeysFailedError
+
+
+@pytest.fixture
+def limiter():
+    return SendRateLimiter(rate_per_sec=10_000)
 
 
 class FakeRenderer:
@@ -271,3 +280,56 @@ async def test_agent_sets_status_on_tool_phase():
     assert "正在搜索 ..." in statuses
     # 进入第二轮续写前应再发「正在处理」
     assert statuses.count("正在处理 ...") >= 2
+
+
+async def test_agent_drives_real_renderer_status_sequence(limiter):
+    """端到端:真实 GuestRenderer 经 Agent 多轮工具调用,可见编辑序列含状态切换。
+
+    验证 Agent↔renderer 集成:状态行在思考/工具阶段实际渲染到消息,
+    finalize 落地纯正文(无状态行),跨轮覆盖式渲染正常。
+    """
+    # 复用 streaming 测试的 GuestFakeBot(支持 AnswerGuestQuery + edit_message_text 记录)
+    from asyncio import sleep as _sleep
+
+    import tests.test_streaming as _ts
+
+    GuestFakeBot = _ts.GuestFakeBot
+
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+
+    chat = ScriptedChat([
+        [  # 第一轮:前导语 + 搜索工具
+            ChatStreamEvent(kind="content", text="好的,我来搜一下。"),
+            ChatStreamEvent(kind="tool_calls", finish_reason="tool_calls",
+                            tool_calls=[ToolCallDelta(id="c1", name="web_search",
+                                                      arguments='{"query":"x"}')]),
+            ChatStreamEvent(kind="finish", finish_reason="tool_calls"),
+        ],
+        [  # 第二轮:基于结果作答
+            ChatStreamEvent(kind="content", text="根据搜索结果,答案是 42。"),
+            ChatStreamEvent(kind="finish", finish_reason="stop"),
+        ],
+    ])
+    agent = Agent(chat)
+    result = await agent.run([{"role": "user", "content": "搜一下"}], r,
+                             ToolDispatcher())
+
+    # 让渲染器的 tick 循环消化完毕
+    await _sleep(0.05)
+
+    # 1) 过程中应出现过含「正在搜索」状态的编辑(工具阶段 set_status 主动渲染)
+    edits_text = [e[0] for e in bot.text_edits]
+    assert any("正在搜索" in t for t in edits_text), (
+        f"工具阶段应渲染搜索状态行,实际编辑 {edits_text}")
+
+    # 2) 末次编辑是定稿纯正文(状态行已清除)
+    assert bot.text_edits[-1][0] == "根据搜索结果,答案是 42。", (
+        f"定稿应为纯正文,实际 {bot.text_edits[-1][0]!r}")
+    assert "正在" not in bot.text_edits[-1][0]
+
+    # 3) Agent 结果正确
+    assert result.text == "根据搜索结果,答案是 42。"
+    assert result.tools_used == ["web_search"]
