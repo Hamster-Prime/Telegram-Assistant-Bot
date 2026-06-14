@@ -250,6 +250,15 @@ class MiniMaxClient:
     async def get(self, endpoint: str, params: dict | None = None) -> dict[str, Any]:
         return await self.request_json("GET", endpoint, params=params)
 
+    async def get_with_key(self, key: str, endpoint: str,
+                           params: dict | None = None) -> dict[str, Any]:
+        """用指定 Key 单次请求(不走多 Key fallback),用于 per-key 查询。
+
+        复用 _once_json 的鉴权 / 状态码 / base_resp 错误处理,失败直接抛
+        MiniMaxError(由上层 errors.py 全局兜底或自行捕获)。
+        """
+        return await self._once_json("GET", endpoint, key, None, params)
+
     # ── 对外:带 fallback 的 SSE 流式请求 ───────────────────
     async def stream_sse(self, endpoint: str, payload: dict) -> AsyncIterator[dict[str, Any]]:
         """流式 POST,逐条 yield SSE data JSON。

@@ -60,6 +60,7 @@ ADMIN_COMMANDS: list[CmdSpec] = [
     CmdSpec("quotas", "配额列表"),
     CmdSpec("users", "用户列表"),
     CmdSpec("stats", "用量统计"),
+    CmdSpec("mmxquota", "MiniMax Token Plan 余额"),
 ]
 
 # 超管追加(superadmin)

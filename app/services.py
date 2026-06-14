@@ -20,6 +20,7 @@ from app.minimax.client import MiniMaxClient
 from app.minimax.files import FilesAPI
 from app.minimax.image import ImageAPI
 from app.minimax.music import MusicAPI
+from app.minimax.quota import QuotaAPI
 from app.minimax.tts import TTSAPI
 from app.minimax.video import VideoAPI
 from app.search.brave import BraveProvider
@@ -64,6 +65,7 @@ class Services:
         self.video_api = VideoAPI(self.mmx, settings.model_video)
         self.music_api = MusicAPI(self.mmx, settings.model_music)
         self.files_api = FilesAPI(self.mmx)
+        self.quota_api = QuotaAPI(self.mmx)
 
         # 搜索(独立 httpx 单例,与 MiniMax 隔离)
         self.search_http = httpx.AsyncClient(

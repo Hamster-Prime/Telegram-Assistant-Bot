@@ -5,6 +5,7 @@
 - 信息命令(/start /help /whoami /quota)HTML 排版 + 视图间导航键盘
 - logic_* 纯函数返回 HTML 文本(无键盘),供 guest 模式复用
 """
+
 from __future__ import annotations
 
 import json
@@ -17,9 +18,12 @@ from app.core.auth import require_role
 from app.core.htmlfmt import sanitize_telegram_html
 from app.db.models import User
 from app.handlers.lists import (
+    mmx_quota_kb,
+    mmx_quota_result_kb,
     render_audit,
     render_help,
     render_memories,
+    render_mmx_quota,
     render_quota_view,
     render_quotas,
     render_stats,
@@ -71,8 +75,7 @@ async def logic_help() -> str:
 
 
 async def logic_whoami(svc: Services, user: User) -> str:
-    text, _ = await render_whoami(svc, user, scope="user", owner=user.tg_id,
-                                  uid=user.tg_id)
+    text, _ = await render_whoami(svc, user, scope="user", owner=user.tg_id, uid=user.tg_id)
     return text
 
 
@@ -84,21 +87,18 @@ async def logic_reset(svc: Services, user: User, chat_id: int) -> str:
 
 
 async def logic_quota(svc: Services, user: User) -> str:
-    text, _ = await render_quota_view(svc, user, scope="user", owner=user.tg_id,
-                                      uid=user.tg_id)
+    text, _ = await render_quota_view(svc, user, scope="user", owner=user.tg_id, uid=user.tg_id)
     return text
 
 
-async def logic_remember(svc: Services, user: User, scope: str, owner: int,
-                         args: str) -> str:
+async def logic_remember(svc: Services, user: User, scope: str, owner: int, args: str) -> str:
     if not args:
         return "用法:/remember 要记住的内容"
     mem_id = await svc.memory.remember(scope, owner, args)
     return f"🧠 已记住(编号 {mem_id})"
 
 
-async def logic_forget(svc: Services, user: User, scope: str, owner: int,
-                       args: str) -> str:
+async def logic_forget(svc: Services, user: User, scope: str, owner: int, args: str) -> str:
     if not args or not args.strip().isdigit():
         return "用法:/forget 记忆编号"
     ok = await svc.daos.memories.delete(int(args.strip()), scope, owner)
@@ -126,8 +126,7 @@ async def cmd_help(message: Message, user: User) -> None:
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message, user: User, svc: Services) -> None:
-    text, kb = await render_whoami(svc, user, scope="user", owner=user.tg_id,
-                                   uid=user.tg_id)
+    text, kb = await render_whoami(svc, user, scope="user", owner=user.tg_id, uid=user.tg_id)
     await _send_info(message, text, kb)
 
 
@@ -138,8 +137,7 @@ async def cmd_reset(message: Message, user: User, svc: Services) -> None:
 
 @router.message(Command("quota"))
 async def cmd_quota(message: Message, user: User, svc: Services) -> None:
-    text, kb = await render_quota_view(svc, user, scope="user", owner=user.tg_id,
-                                       uid=user.tg_id)
+    text, kb = await render_quota_view(svc, user, scope="user", owner=user.tg_id, uid=user.tg_id)
     await _send_info(message, text, kb)
 
 
@@ -153,38 +151,33 @@ def _scope_of(message: Message, user: User) -> tuple[str, int]:
 def _explicit_dispatcher(svc: Services, message: Message, user: User):
     """显式命令复用的工具分发器(6 个生成/搜索命令共用)。"""
     from app.handlers.pipeline import build_dispatcher
+
     scope, owner = _scope_of(message, user)
     return build_dispatcher(svc, user, message.chat.id, scope, owner)
 
 
 @router.message(Command("remember"))
-async def cmd_remember(message: Message, command: CommandObject, user: User,
-                       svc: Services) -> None:
+async def cmd_remember(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     scope, owner = _scope_of(message, user)
-    await message.answer(await logic_remember(svc, user, scope, owner,
-                                              command.args or ""))
+    await message.answer(await logic_remember(svc, user, scope, owner, command.args or ""))
 
 
 @router.message(Command("memories"))
 async def cmd_memories(message: Message, user: User, svc: Services) -> None:
     scope, owner = _scope_of(message, user)
     text, kb = await render_memories(svc, scope, owner, user.tg_id, page=1)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb,
-                         disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.message(Command("forget"))
-async def cmd_forget(message: Message, command: CommandObject, user: User,
-                     svc: Services) -> None:
+async def cmd_forget(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     scope, owner = _scope_of(message, user)
-    await message.answer(await logic_forget(svc, user, scope, owner,
-                                            command.args or ""))
+    await message.answer(await logic_forget(svc, user, scope, owner, command.args or ""))
 
 
 # ── 管理命令(admin+) ─────────────────────────────────────────
 @router.message(Command("grant"))
-async def cmd_grant(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_grant(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
@@ -200,13 +193,13 @@ async def cmd_grant(message: Message, command: CommandObject, user: User,
     target_user = await svc.daos.users.get(target)
     if target_user is not None and target_user.role in ("admin", "superadmin"):
         from app.handlers.commands_registry import refresh_user_commands
+
         await refresh_user_commands(svc.bot, target, target_user.role)
     await message.answer(f"✅ 已授权用户 {target}(套用默认配额)")
 
 
 @router.message(Command("revoke"))
-async def cmd_revoke(message: Message, command: CommandObject, user: User,
-                     svc: Services) -> None:
+async def cmd_revoke(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
@@ -221,20 +214,21 @@ async def cmd_revoke(message: Message, command: CommandObject, user: User,
     await svc.daos.audit.add(user.tg_id, "revoke", target, "撤销授权")
     # 撤权后该用户降为普通菜单(若曾有 admin 命令,现在不再显示)
     from app.handlers.commands_registry import refresh_user_commands
+
     await refresh_user_commands(svc.bot, target, "user")
     await message.answer(f"🚫 已撤销用户 {target} 的授权")
 
 
 @router.message(Command("setquota"))
-async def cmd_setquota(message: Message, command: CommandObject, user: User,
-                       svc: Services) -> None:
+async def cmd_setquota(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
     parts = (command.args or "").split()
     if len(parts) < 3 or parts[1] not in ("calls", "tokens"):
         await message.answer(
-            "用法:/setquota <用户ID> <calls|tokens> <上限> [day|month|total]\n-1 = 无限")
+            "用法:/setquota <用户ID> <calls|tokens> <上限> [day|month|total]\n-1 = 无限"
+        )
         return
     try:
         target, mode, limit = int(parts[0]), parts[1], int(parts[2])
@@ -243,14 +237,14 @@ async def cmd_setquota(message: Message, command: CommandObject, user: User,
         return
     period = parts[3] if len(parts) > 3 and parts[3] in ("day", "month", "total") else "day"
     await svc.daos.quotas.set(target, mode, limit, period)
-    await svc.daos.audit.add(user.tg_id, "setquota", target,
-                             f"{mode}={limit}/{period}")
+    await svc.daos.audit.add(user.tg_id, "setquota", target, f"{mode}={limit}/{period}")
     await message.answer(f"📊 已设置用户 {target} 配额:{mode} {limit}({period})")
 
 
 @router.message(Command("resetquota"))
-async def cmd_resetquota(message: Message, command: CommandObject, user: User,
-                         svc: Services) -> None:
+async def cmd_resetquota(
+    message: Message, command: CommandObject, user: User, svc: Services
+) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
@@ -277,8 +271,7 @@ def _require_private(message: Message) -> bool:
 
 
 @router.message(Command("quotas"))
-async def cmd_quotas(message: Message, command: CommandObject, user: User,
-                     svc: Services) -> None:
+async def cmd_quotas(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
@@ -289,13 +282,11 @@ async def cmd_quotas(message: Message, command: CommandObject, user: User,
     if command.args and command.args.strip().isdigit():
         page = max(1, int(command.args.strip()))
     text, kb = await render_quotas(svc, user.tg_id, page)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb,
-                         disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.message(Command("users"))
-async def cmd_users(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_users(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
@@ -306,8 +297,7 @@ async def cmd_users(message: Message, command: CommandObject, user: User,
     if command.args and command.args.strip().isdigit():
         page = max(1, int(command.args.strip()))
     text, kb = await render_users(svc, user.tg_id, page)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb,
-                         disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.message(Command("stats"))
@@ -319,14 +309,59 @@ async def cmd_stats(message: Message, user: User, svc: Services) -> None:
         await message.answer("ℹ️ 该命令请在与我的私聊中使用(列表含敏感信息)。")
         return
     text, kb = await render_stats(svc, user.tg_id, page=1)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb,
-                         disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+@router.message(Command("mmxquota"))
+async def cmd_mmxquota(message: Message, user: User, svc: Services) -> None:
+    """查询 MiniMax Token Plan 用量与剩余额度(管理员)。
+
+    多账号(每个 API Key = 一个 Token Plan 订阅)时弹出内联键盘选择;
+    单账号直接查询。
+    """
+    if not require_role(user, "admin"):
+        await message.answer("⛔ 需要管理员权限")
+        return
+    keys = svc.settings.minimax_keys
+    if not keys:
+        await message.answer("⚠️ 未配置 MINIMAX_API_KEYS")
+        return
+    # 单账号:直接查询,省去选择步骤
+    if len(keys) == 1:
+        await _answer_mmx_quota(message, svc, key_idx=0, uid=user.tg_id)
+        return
+    # 多账号:弹选择键盘
+    kb = mmx_quota_kb(keys, user.tg_id)
+    await message.answer("📊 请选择要查询的 Token Plan 账号:", reply_markup=kb)
+
+
+async def _answer_mmx_quota(message: Message, svc: Services, *, key_idx: int, uid: int) -> None:
+    """查询并回复/编辑单个账号的 Token Plan 配额。供命令入口与刷新回调共用。
+
+    出错时不抛(命令入口无键盘可编辑),直接回错误文本。
+    """
+    from app.minimax.client import MiniMaxError
+
+    keys = svc.settings.minimax_keys
+    key = keys[key_idx]
+    notifying = await message.answer("⏳ 正在查询 Token Plan 用量…")
+    try:
+        remains = await svc.quota_api.remains(key)
+    except MiniMaxError as e:
+        await message.answer(e.user_message())
+        return
+    text = render_mmx_quota(key_idx, key, remains)
+    kb = mmx_quota_result_kb(key_idx, len(keys), uid)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    try:
+        await notifying.delete()
+    except Exception as e:
+        log.debug("删除查询中提示失败(忽略)", 错误=str(e)[:120])
 
 
 # ── 超管命令 ───────────────────────────────────────────────────
 @router.message(Command("promote"))
-async def cmd_promote(message: Message, command: CommandObject, user: User,
-                      svc: Services) -> None:
+async def cmd_promote(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not user.is_superadmin:
         await message.answer("⛔ 需要超级管理员权限")
         return
@@ -339,13 +374,13 @@ async def cmd_promote(message: Message, command: CommandObject, user: User,
     await svc.daos.users.set_authorized(target, True, by=user.tg_id)
     await svc.daos.audit.add(user.tg_id, "promote", target, "提升为管理员")
     from app.handlers.commands_registry import refresh_user_commands
+
     await refresh_user_commands(svc.bot, target, "admin")
     await message.answer(f"🛡 已提升用户 {target} 为管理员")
 
 
 @router.message(Command("demote"))
-async def cmd_demote(message: Message, command: CommandObject, user: User,
-                     svc: Services) -> None:
+async def cmd_demote(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not user.is_superadmin:
         await message.answer("⛔ 需要超级管理员权限")
         return
@@ -359,13 +394,15 @@ async def cmd_demote(message: Message, command: CommandObject, user: User,
     await svc.daos.users.set_role(target, "user")
     await svc.daos.audit.add(user.tg_id, "demote", target, "降级为普通用户")
     from app.handlers.commands_registry import refresh_user_commands
+
     await refresh_user_commands(svc.bot, target, "user")
     await message.answer(f"⬇️ 已将用户 {target} 降级为普通用户")
 
 
 @router.message(Command("broadcast"))
-async def cmd_broadcast(message: Message, command: CommandObject, user: User,
-                        svc: Services) -> None:
+async def cmd_broadcast(
+    message: Message, command: CommandObject, user: User, svc: Services
+) -> None:
     if not user.is_superadmin:
         await message.answer("⛔ 需要超级管理员权限")
         return
@@ -378,20 +415,18 @@ async def cmd_broadcast(message: Message, command: CommandObject, user: User,
         try:
             await svc.limiter.acquire()
             await svc.bot.send_message(
-                uid, sanitize_telegram_html(f"📢 管理员广播:\n{command.args}"),
-                parse_mode="HTML")
+                uid, sanitize_telegram_html(f"📢 管理员广播:\n{command.args}"), parse_mode="HTML"
+            )
             sent += 1
         except Exception:
             failed += 1
-    await svc.daos.audit.add(user.tg_id, "broadcast", None,
-                             f"成功{sent} 失败{failed}")
+    await svc.daos.audit.add(user.tg_id, "broadcast", None, f"成功{sent} 失败{failed}")
     await message.answer(f"📢 广播完成:成功 {sent},失败 {failed}")
     log.info("广播完成", 操作人=user.tg_id, 成功=sent, 失败=failed)
 
 
 @router.message(Command("audit"))
-async def cmd_audit(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_audit(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not user.is_superadmin:
         await message.answer("⛔ 需要超级管理员权限")
         return
@@ -402,14 +437,12 @@ async def cmd_audit(message: Message, command: CommandObject, user: User,
     if command.args and command.args.strip().isdigit():
         page = max(1, int(command.args.strip()))
     text, kb = await render_audit(svc, user.tg_id, page)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb,
-                         disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 
 # ── 显式生成/搜索命令 ─────────────────────────────────────────
 @router.message(Command("image"))
-async def cmd_image(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_image(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/image 图片描述")
         return
@@ -420,8 +453,7 @@ async def cmd_image(message: Message, command: CommandObject, user: User,
 
 
 @router.message(Command("video"))
-async def cmd_video(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_video(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/video 视频描述")
         return
@@ -432,8 +464,7 @@ async def cmd_video(message: Message, command: CommandObject, user: User,
 
 
 @router.message(Command("tts"))
-async def cmd_tts(message: Message, command: CommandObject, user: User,
-                  svc: Services) -> None:
+async def cmd_tts(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/tts 要朗读的文本")
         return
@@ -444,8 +475,7 @@ async def cmd_tts(message: Message, command: CommandObject, user: User,
 
 
 @router.message(Command("music"))
-async def cmd_music(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_music(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/music 音乐描述")
         return
@@ -456,8 +486,7 @@ async def cmd_music(message: Message, command: CommandObject, user: User,
 
 
 @router.message(Command("search"))
-async def cmd_search(message: Message, command: CommandObject, user: User,
-                     svc: Services) -> None:
+async def cmd_search(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/search 搜索关键词")
         return
@@ -467,8 +496,7 @@ async def cmd_search(message: Message, command: CommandObject, user: User,
 
 
 @router.message(Command("fetch"))
-async def cmd_fetch(message: Message, command: CommandObject, user: User,
-                    svc: Services) -> None:
+async def cmd_fetch(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
         await message.answer("用法:/fetch 网址")
         return

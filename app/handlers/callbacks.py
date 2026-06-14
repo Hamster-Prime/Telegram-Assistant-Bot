@@ -12,6 +12,7 @@
 回调不挂 AuthMiddleware(只注册了 message/guest_message/inline_query),
 故在此手动从 DB 取 user 复核授权。
 """
+
 from __future__ import annotations
 
 from aiogram import F, Router
@@ -20,10 +21,14 @@ from aiogram.types import CallbackQuery
 from app.handlers.lists import (
     CloseCB,
     ListPageCB,
+    MmxQuotaCB,
     NavCB,
+    mmx_quota_kb,
+    mmx_quota_result_kb,
     render_audit,
     render_help,
     render_memories,
+    render_mmx_quota,
     render_quota_view,
     render_quotas,
     render_stats,
@@ -31,6 +36,7 @@ from app.handlers.lists import (
     render_whoami,
 )
 from app.logging import get_logger
+from app.minimax.client import MiniMaxError
 from app.services import Services
 
 log = get_logger("handlers.callbacks")
@@ -63,7 +69,9 @@ async def _safe_edit(cb: CallbackQuery, text: str, kb) -> bool:
     """编辑消息文本;消息已失效(超时/已删)时静默应答。返回是否成功。"""
     try:
         await cb.message.edit_text(
-            text, parse_mode="HTML", reply_markup=kb,
+            text,
+            parse_mode="HTML",
+            reply_markup=kb,
             disable_web_page_preview=True,
         )
         return True
@@ -90,8 +98,7 @@ async def _dispatch_list(svc: Services, cb_data: ListPageCB):
 
 
 @router.callback_query(ListPageCB.filter())
-async def on_list_page(cb: CallbackQuery, callback_data: ListPageCB,
-                       svc: Services) -> None:
+async def on_list_page(cb: CallbackQuery, callback_data: ListPageCB, svc: Services) -> None:
     """列表翻页:校验权限 → 取数渲染 → 编辑消息。"""
     if not await _check_owner(cb, callback_data.uid):
         return
@@ -112,8 +119,7 @@ async def on_list_page(cb: CallbackQuery, callback_data: ListPageCB,
 
 
 @router.callback_query(NavCB.filter())
-async def on_nav(cb: CallbackQuery, callback_data: NavCB,
-                 svc: Services) -> None:
+async def on_nav(cb: CallbackQuery, callback_data: NavCB, svc: Services) -> None:
     """信息视图导航:help/whoami/quota 间切换。"""
     if not await _check_owner(cb, callback_data.uid):
         return
@@ -135,9 +141,53 @@ async def on_nav(cb: CallbackQuery, callback_data: NavCB,
         await cb.answer()
 
 
+@router.callback_query(MmxQuotaCB.filter())
+async def on_mmx_quota(cb: CallbackQuery, callback_data: MmxQuotaCB, svc: Services) -> None:
+    """Token Plan 配额查询回调。
+
+    - key_idx == -1:返回账号选择键盘(从结果页「选择账号」按钮触发)
+    - key_idx >= 0:查询指定账号并渲染结果(刷新按钮也走此分支)
+    """
+    if not await _check_owner(cb, callback_data.uid):
+        return
+    user = await _load_user(svc, cb, callback_data.uid)
+    if user is None:
+        return
+    if not user.is_admin:
+        await cb.answer("需要管理员权限", show_alert=True)
+        return
+    keys = svc.settings.minimax_keys
+    if not keys:
+        await cb.answer("未配置 API Key", show_alert=True)
+        return
+
+    # 返回账号选择键盘
+    if callback_data.key_idx < 0:
+        if await _safe_edit(
+            cb, "📊 请选择要查询的 Token Plan 账号:", mmx_quota_kb(keys, callback_data.uid)
+        ):
+            await cb.answer()
+        return
+
+    idx = callback_data.key_idx
+    if idx >= len(keys):
+        await cb.answer("该账号已失效(配置已变更)", show_alert=True)
+        return
+    key = keys[idx]
+    try:
+        remains = await svc.quota_api.remains(key)
+    except MiniMaxError as e:
+        if await _safe_edit(cb, e.user_message(), None):
+            await cb.answer()
+        return
+    text = render_mmx_quota(idx, key, remains)
+    kb = mmx_quota_result_kb(idx, len(keys), callback_data.uid)
+    if await _safe_edit(cb, text, kb):
+        await cb.answer()
+
+
 @router.callback_query(CloseCB.filter())
-async def on_close(cb: CallbackQuery, callback_data: CloseCB,
-                   svc: Services) -> None:
+async def on_close(cb: CallbackQuery, callback_data: CloseCB, svc: Services) -> None:
     """关闭:校验发起人后删除消息。"""
     if callback_data.uid and not await _check_owner(cb, callback_data.uid):
         return
