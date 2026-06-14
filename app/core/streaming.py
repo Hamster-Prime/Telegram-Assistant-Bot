@@ -355,6 +355,7 @@ class _TickLoopMixin:
     _pending: str | None
     _committed: str
     _status: str
+    _last_placeholder_render: str
     _last_edit_time: float
 
     def _tick_init(self, interval_s: float) -> None:
@@ -364,10 +365,16 @@ class _TickLoopMixin:
         self._pending = None
         self._committed = ""
         self._status = "正在思考 ..."
+        self._last_placeholder_render = ""
         self._last_edit_time = 0.0
 
     async def set_status(self, status: str) -> None:
-        """仅暂存状态文案;下次 tick 合并渲染(与 update 同为非阻塞暂存)。"""
+        """仅暂存状态文案;下次 tick 合并渲染(与 update 同为非阻塞暂存)。
+
+        渲染时机:状态行的实际刷新发生在①内容写入或③占位分支的下次 tick。
+        若在②idle 期(已有正文、暂无新内容)调用,状态不会立即显示,须等到
+        下一次 update() 触发内容写入 —— 故调用方宜在每段正文流式开始前设置状态。
+        """
         self._status = status
 
     async def _ensure_interval_elapsed(self) -> None:
@@ -411,11 +418,16 @@ class _TickLoopMixin:
                     # 「占位阶段」分支;idle 期无需任何编辑。
                     pass
                 else:
-                    # ③ 占位阶段(首条内容前):渲染纯状态行
-                    try:
-                        await do_edit("<i>" + self._status + "</i>")
-                    except Exception as e:
-                        log.warning("占位状态行编辑失败(忽略)", 错误=str(e)[:120])
+                    # ③ 占位阶段(首条内容前):渲染纯状态行;状态未变则不重复编辑
+                    rendered = "<i>" + self._status + "</i>"
+                    if rendered == self._last_placeholder_render:
+                        pass  # 状态行未变,跳过编辑(避免 "not modified" 空转)
+                    else:
+                        self._last_placeholder_render = rendered
+                        try:
+                            await do_edit(rendered)
+                        except Exception as e:
+                            log.warning("占位状态行编辑失败(忽略)", 错误=str(e)[:120])
                 # 等到下一个 tick(或停止信号)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)

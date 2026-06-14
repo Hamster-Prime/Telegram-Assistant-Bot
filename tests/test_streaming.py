@@ -351,7 +351,7 @@ async def test_placeholder_shows_status_line(limiter):
     edits_text = [e[2] for e in bot.edits]
     assert any("正在思考 ..." in t for t in edits_text), (
         f"占位阶段应显示状态行,实际编辑 {edits_text}")
-    assert " " not in edits_text, "不应再有 nbsp 占位闪烁"
+    assert not any(" " in t for t in edits_text), "不应再有 nbsp 占位闪烁"
 
 
 async def test_content_edit_has_status_line_suffix(limiter):
@@ -600,3 +600,23 @@ async def test_set_status_drives_status_line(limiter):
                      if "正文内容" in e[0] and "正在搜索 ..." in e[0]]
     assert content_edits, "应有一次带状态行的内容写入编辑"
     await r.finalize("正文内容完成")
+
+async def test_placeholder_dedup_when_status_unchanged(limiter):
+    """占位阶段状态未变时,不每 tick 重复编辑(避免 not-modified 空转)。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    # 占位阶段,状态保持默认「正在思考 ...」,等待多个 tick
+    await asyncio.sleep(0.05)
+    n1 = len(bot.text_edits)
+    # 再等更多 tick,状态仍不变
+    await asyncio.sleep(0.05)
+    n2 = len(bot.text_edits)
+    # 首次渲染后会因 dedup 跳过,编辑计数不应持续增长
+    assert n2 - n1 <= 1, f"占位状态未变时不应重复编辑,增量 {n2 - n1}"
+    # 但状态变化时必须重新编辑
+    await r.set_status("正在搜索 ...")
+    await asyncio.sleep(0.03)
+    assert any("正在搜索 ..." in e[0] for e in bot.text_edits), "状态变化应触发编辑"
+    await r.finalize("x")
