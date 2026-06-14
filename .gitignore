@@ -6,7 +6,7 @@ __pycache__/
 .pytest_cache/
 
 # 环境与数据
-/.venv
+.venv/
 uv.lock
 .env
 data/*.db
@@ -17,3 +17,4 @@ data/cache/
 # IDE
 .idea/
 .vscode/
+.claude/
