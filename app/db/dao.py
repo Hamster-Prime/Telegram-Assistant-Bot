@@ -216,12 +216,24 @@ class MessageDAO:
         )
         return row["created_at"] if row else None
 
-    async def clear_chat(self, chat_id: int) -> None:
-        await self.db.execute_many([
+    async def clear_chat(self, chat_id: int, *,
+                         scope: str | None = None, owner: int | None = None) -> None:
+        """清空会话上下文(messages + summaries)。
+
+        可选 scope/owner:同时删除该范围内的持久记忆。仅 Guest 的清空路径传入
+        (Guest 不应持有永久记忆,这里清理旧版本/历史残留,并兑现"清空即失效")。
+        Private/Group 的 /reset 不传,保持"长期记忆保留"语义。
+        """
+        stmts: list[tuple[str, tuple]] = [
             ("DELETE FROM messages WHERE chat_id=?", (chat_id,)),
             ("DELETE FROM summaries WHERE chat_id=?", (chat_id,)),
-        ])
-        log.info("会话上下文已清空", 会话=chat_id)
+        ]
+        if scope is not None and owner is not None:
+            stmts.append(
+                ("DELETE FROM memories WHERE scope=? AND owner_id=?", (scope, owner))
+            )
+        await self.db.execute_many(stmts)
+        log.info("会话上下文已清空", 会话=chat_id, 范围=scope or "无", 归属=owner or "无")
 
 
 class SummaryDAO:

@@ -249,6 +249,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+# Guest 模式需要从工具集中剔除的永久记忆相关工具名。
+# 剔除后模型根本看不到这两个工具,不会尝试调用,从源头杜绝 Guest 写/读永久记忆。
+_MEMORY_TOOL_NAMES = frozenset({"save_memory", "search_memory"})
+
+
+def tools_without_memory() -> list[dict[str, Any]]:
+    """返回剔除记忆工具后的 schema 副本(Guest 模式用)。"""
+    return [t for t in TOOL_SCHEMAS
+            if t["function"]["name"] not in _MEMORY_TOOL_NAMES]
+
+
 ToolFunc = Callable[[dict[str, Any]], Awaitable[str]]
 
 

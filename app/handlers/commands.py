@@ -96,11 +96,20 @@ async def logic_whoami(svc: Services, user: User) -> str:
     return text
 
 
-async def logic_reset(svc: Services, user: User, chat_id: int) -> str:
+async def logic_reset(svc: Services, user: User, chat_id: int, *,
+                      scope: str | None = None, owner: int | None = None) -> str:
+    """重置当前会话上下文。
+
+    scope/owner:可选,同时删除该范围持久记忆。仅 Guest /reset 传入
+    (Guest 不持有永久记忆,清理残留并兑现"清空即失效")。
+    Private/Group 不传 → 长期记忆保留。
+    """
     async with svc.user_lock.for_user(user.tg_id):
-        await svc.daos.messages.clear_chat(chat_id)
-    log.info("会话已重置", 用户=user.tg_id, 会话=chat_id)
-    return "🧹 当前会话上下文已清空(长期记忆保留)"
+        await svc.daos.messages.clear_chat(chat_id, scope=scope, owner=owner)
+    log.info("会话已重置", 用户=user.tg_id, 会话=chat_id, 范围=scope or "无")
+    if scope is not None:
+        return "🧹 当前会话上下文已清空 (Guest 模式不保留永久记忆)"
+    return "🧹 当前会话上下文已清空 (长期记忆保留)"
 
 
 async def logic_quota(svc: Services, user: User) -> str:
@@ -112,14 +121,14 @@ async def logic_remember(svc: Services, user: User, scope: str, owner: int, args
     if not args:
         return "用法:/remember 要记住的内容"
     mem_id = await svc.memory.remember(scope, owner, args)
-    return f"🧠 已记住(编号 {mem_id})"
+    return f"🧠 已记住 (编号 {mem_id})"
 
 
 async def logic_forget(svc: Services, user: User, scope: str, owner: int, args: str) -> str:
     if not args or not args.strip().isdigit():
-        return "用法:/forget 记忆编号"
+        return "用法: /forget 记忆编号"
     ok = await svc.daos.memories.delete(int(args.strip()), scope, owner)
-    return "🗑 已删除" if ok else "未找到该记忆(只能删除自己范围内的)"
+    return "🗑 已删除" if ok else "未找到该记忆 (只能删除自己范围内的)"
 
 
 # ── 基础命令 ───────────────────────────────────────────────────
@@ -205,7 +214,7 @@ async def cmd_grant(message: Message, command: CommandObject, user: User, svc: S
         return
     info = extract_target_info(message, command.args or "")
     if info is None:
-        await message.answer("用法:/grant <用户ID>(或回复目标用户的消息)")
+        await message.answer("用法:/grant <用户ID> (或回复目标用户的消息)")
         return
     await message.answer(
         await logic_grant(svc, user, info.tg_id, username=info.username, first_name=info.first_name),
@@ -220,7 +229,7 @@ async def cmd_revoke(message: Message, command: CommandObject, user: User, svc: 
         return
     info = extract_target_info(message, command.args or "")
     if info is None:
-        await message.answer("用法:/revoke <用户ID>(或回复目标用户的消息)")
+        await message.answer("用法:/revoke <用户ID> (或回复目标用户的消息)")
         return
     await message.answer(
         await logic_revoke(svc, user, info.tg_id, username=info.username, first_name=info.first_name),
@@ -250,13 +259,13 @@ async def cmd_setquota(message: Message, command: CommandObject, user: User, svc
         try:
             target, mode, limit_str = int(parts[0]), parts[1], parts[2]
         except ValueError:
-            await message.answer("参数错误:用户ID 与上限必须是数字")
+            await message.answer("参数错误: 用户ID 与上限必须是数字")
             return
         period = parts[3] if len(parts) > 3 and parts[3] in ("day", "month", "total") else "day"
     try:
         limit = int(limit_str)
     except ValueError:
-        await message.answer("参数错误:上限必须是数字")
+        await message.answer("参数错误: 上限必须是数字")
         return
     await message.answer(await logic_setquota(svc, user, target, mode, limit, period), parse_mode="HTML")
 
@@ -294,7 +303,7 @@ async def cmd_userinfo(message: Message, command: CommandObject, user: User, svc
         return
     target = _parse_target_id(message, command)
     if target is None:
-        await message.answer("用法:/userinfo <用户ID>(或回复目标用户的消息)")
+        await message.answer("用法:/userinfo <用户ID> (或回复目标用户的消息)")
         return
     await message.answer(await logic_userinfo(svc, user, target), parse_mode="HTML")
 
@@ -312,7 +321,7 @@ async def cmd_quotas(message: Message, command: CommandObject, user: User, svc: 
         await message.answer("⛔ 需要管理员权限")
         return
     if not _require_private(message):
-        await message.answer("ℹ️ 该命令请在与我的私聊中使用(列表含敏感信息)。")
+        await message.answer("ℹ️ 该命令请在与我的私聊中使用 (列表含敏感信息)。")
         return
     page = 1
     if command.args and command.args.strip().isdigit():
@@ -327,7 +336,7 @@ async def cmd_users(message: Message, command: CommandObject, user: User, svc: S
         await message.answer("⛔ 需要管理员权限")
         return
     if not _require_private(message):
-        await message.answer("ℹ️ 该命令请在与我的私聊中使用(列表含敏感信息)。")
+        await message.answer("ℹ️ 该命令请在与我的私聊中使用 (列表含敏感信息)。")
         return
     page = 1
     if command.args and command.args.strip().isdigit():
@@ -342,7 +351,7 @@ async def cmd_stats(message: Message, user: User, svc: Services) -> None:
         await message.answer("⛔ 需要管理员权限")
         return
     if not _require_private(message):
-        await message.answer("ℹ️ 该命令请在与我的私聊中使用(列表含敏感信息)。")
+        await message.answer("ℹ️ 该命令请在与我的私聊中使用 (列表含敏感信息)。")
         return
     text, kb = await render_stats(svc, user.tg_id, page=1)
     await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
@@ -350,9 +359,9 @@ async def cmd_stats(message: Message, user: User, svc: Services) -> None:
 
 @router.message(Command("mmxquota"))
 async def cmd_mmxquota(message: Message, user: User, svc: Services) -> None:
-    """查询 MiniMax Token Plan 用量与剩余额度(管理员)。
+    """查询 MiniMax Token Plan 用量与剩余额度 (管理员)。
 
-    多账号(每个 API Key = 一个 Token Plan 订阅)时弹出内联键盘选择;
+    多账号 (每个 API Key = 一个 Token Plan 订阅) 时弹出内联键盘选择;
     单账号直接查询。
     """
     if not require_role(user, "admin"):
@@ -392,7 +401,7 @@ async def _answer_mmx_quota(message: Message, svc: Services, *, key_idx: int, ui
     try:
         await notifying.delete()
     except Exception as e:
-        log.debug("删除查询中提示失败(忽略)", 错误=str(e)[:120])
+        log.debug("删除查询中提示失败 (忽略)", 错误=str(e)[:120])
 
 
 # ── 超管命令 ───────────────────────────────────────────────────
@@ -422,7 +431,7 @@ async def cmd_demote(message: Message, command: CommandObject, user: User, svc: 
         return
     target = _parse_target_id(message, command)
     if target is None:
-        await message.answer("用法:/demote <用户ID>")
+        await message.answer("用法: /demote <用户ID>")
         return
     if target in svc.settings.superadmin_id_list:
         await message.answer("⛔ 不能降级超级管理员")
@@ -443,7 +452,7 @@ async def cmd_broadcast(
         await message.answer("⛔ 需要超级管理员权限")
         return
     if not command.args:
-        await message.answer("用法:/broadcast 广播内容")
+        await message.answer("用法: /broadcast 广播内容")
         return
     ids = await svc.daos.users.list_authorized_ids()
     sent = failed = 0
@@ -457,7 +466,7 @@ async def cmd_broadcast(
         except Exception:
             failed += 1
     await svc.daos.audit.add(user.tg_id, "broadcast", None, f"成功{sent} 失败{failed}")
-    await message.answer(f"📢 广播完成:成功 {sent},失败 {failed}")
+    await message.answer(f"📢 广播完成: 成功 {sent},失败 {failed}")
     log.info("广播完成", 操作人=user.tg_id, 成功=sent, 失败=failed)
 
 
@@ -467,7 +476,7 @@ async def cmd_audit(message: Message, command: CommandObject, user: User, svc: S
         await message.answer("⛔ 需要超级管理员权限")
         return
     if not _require_private(message):
-        await message.answer("ℹ️ 该命令请在与我的私聊中使用(列表含敏感信息)。")
+        await message.answer("ℹ️ 该命令请在与我的私聊中使用 (列表含敏感信息)。")
         return
     page = 1
     if command.args and command.args.strip().isdigit():
@@ -480,7 +489,7 @@ async def cmd_audit(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("image"))
 async def cmd_image(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/image 图片描述\n"
+        await message.answer("用法: /image 图片描述\n"
                              "💡 回复一张图片再用此命令可进行图生图")
         return
     from app.handlers.media import extract_references
@@ -494,7 +503,7 @@ async def cmd_image(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("video"))
 async def cmd_video(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/video 视频描述\n"
+        await message.answer("用法: /video 视频描述\n"
                              "💡 回复图片可进行图生视频(1张=首帧,2张=首尾帧)")
         return
     from app.handlers.media import extract_references
@@ -508,7 +517,7 @@ async def cmd_video(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("tts"))
 async def cmd_tts(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/tts 要朗读的文本")
+        await message.answer("用法: /tts 要朗读的文本")
         return
     d = _explicit_dispatcher(svc, message, user)
     result = await d.dispatch("synthesize_speech", json.dumps({"text": command.args}))
@@ -519,7 +528,7 @@ async def cmd_tts(message: Message, command: CommandObject, user: User, svc: Ser
 @router.message(Command("music"))
 async def cmd_music(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/music 音乐描述")
+        await message.answer("用法: /music 音乐描述")
         return
     d = _explicit_dispatcher(svc, message, user)
     result = await d.dispatch("generate_music", json.dumps({"prompt": command.args}))
@@ -530,7 +539,7 @@ async def cmd_music(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("clone"))
 async def cmd_clone(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:回复一条语音/音频,发送 /clone 音色名\n"
+        await message.answer("用法: 回复一条语音/音频,发送 /clone 音色名\n"
                              "💡 音色名8-256字符,首字符必须字母")
         return
     from app.handlers.media import extract_references
@@ -555,8 +564,8 @@ async def cmd_voices(message: Message, command: CommandObject, user: User, svc: 
 @router.message(Command("design_voice"))
 async def cmd_design_voice(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/design_voice 音色描述\n"
-                             "示例:/design_voice 低沉磁性的男声播音员")
+        await message.answer("用法: /design_voice 音色描述\n"
+                             "示例: /design_voice 低沉磁性的男声播音员")
         return
     d = _explicit_dispatcher(svc, message, user)
     result = await d.dispatch("design_voice", json.dumps({
@@ -569,7 +578,7 @@ async def cmd_design_voice(message: Message, command: CommandObject, user: User,
 @router.message(Command("search"))
 async def cmd_search(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/search 搜索关键词")
+        await message.answer("用法: /search 搜索关键词")
         return
     d = _explicit_dispatcher(svc, message, user)
     result = await d.dispatch("web_search", json.dumps({"query": command.args}))
@@ -579,7 +588,7 @@ async def cmd_search(message: Message, command: CommandObject, user: User, svc: 
 @router.message(Command("fetch"))
 async def cmd_fetch(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/fetch 网址")
+        await message.answer("用法: /fetch 网址")
         return
     d = _explicit_dispatcher(svc, message, user)
     result = await d.dispatch("web_fetch", json.dumps({"url": command.args.strip()}))

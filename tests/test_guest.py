@@ -660,12 +660,14 @@ async def test_guest_non_command_returns_none():
 
 
 async def test_guest_reset_command_uses_logic(monkeypatch):
-    """/reset 走 logic_reset,不再落入 AI。"""
+    """/reset 走 logic_reset(带 scope/owner 清理 Guest 残留记忆),不再落入 AI。"""
     from app.handlers import guest_commands
-    called = {"reset": False}
+    called = {"reset": False, "scope": None, "owner": None}
 
-    async def fake_reset(svc, user, chat_id):
+    async def fake_reset(svc, user, chat_id, *, scope=None, owner=None):
         called["reset"] = True
+        called["scope"] = scope
+        called["owner"] = owner
         return "🧹 已清空"
 
     monkeypatch.setattr(guest_commands, "logic_reset", fake_reset)
@@ -673,6 +675,9 @@ async def test_guest_reset_command_uses_logic(monkeypatch):
         make_svc(), User(tg_id=77, first_name="C"),
         make_guest_message("/reset"))
     assert called["reset"] is True
+    # Guest /reset 必须透传 scope=chat/owner=chat_id,以便清理残留记忆
+    assert called["scope"] == "chat"
+    assert called["owner"] == 200
     assert result == "🧹 已清空"
 
 
@@ -788,3 +793,53 @@ async def test_execute_guest_command_strips_mention_prefix():
         svc, user, message, bot_username="my_bot")
     assert result is not None
     assert "助理机器人" in result
+
+
+# ── Guest 模式永久记忆彻底禁用 ──────────────────────────────────
+async def test_guest_pipeline_called_with_memory_disabled(monkeypatch):
+    """process_guest_message 必须以 enable_memory=False 调用 pipeline(Guest 无永久记忆)。"""
+    captured: dict = {}
+
+    async def fake_pipeline(svc, user, message, content, renderer, **kwargs):
+        captured["enable_memory"] = kwargs.get("enable_memory")
+        captured["scope"] = kwargs.get("scope")
+
+    class FakeGuestRenderer:
+        def __init__(self, *a, **kw):
+            pass
+
+    monkeypatch.setattr(guest, "run_chat_pipeline", fake_pipeline)
+    monkeypatch.setattr(guest, "GuestRenderer", FakeGuestRenderer)
+
+    svc = make_svc()
+    user = User(tg_id=77, username="caller", first_name="C")
+    message = make_guest_message("@my_bot 你好")
+
+    await guest.process_guest_message(message, user, svc)
+    assert captured["enable_memory"] is False
+    assert captured["scope"] == "chat"
+
+
+async def test_guest_remember_command_returns_hint_not_writing():
+    """/remember 在 Guest 场景返回提示,绝不调用 logic_remember 写入。"""
+    from app.handlers import guest_commands
+
+    svc = make_svc()
+    user = User(tg_id=77, first_name="C")
+    result = await guest_commands.execute_guest_command(
+        svc, user, make_guest_message("/remember 记住我喜欢猫"))
+    assert result is not None
+    assert "不保存永久记忆" in result
+    assert "30 分钟" in result
+
+
+async def test_guest_forget_command_returns_hint():
+    """/forget 在 Guest 场景同样返回提示(无记忆可删)。"""
+    from app.handlers import guest_commands
+
+    svc = make_svc()
+    user = User(tg_id=77, first_name="C")
+    result = await guest_commands.execute_guest_command(
+        svc, user, make_guest_message("/forget 1"))
+    assert result is not None
+    assert "不保存永久记忆" in result

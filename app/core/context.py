@@ -376,8 +376,13 @@ class ContextBuilder:
         scope_owner: int | None = None,
         query_text: str = "",
         extra_system: str = "",
+        enable_memory: bool = True,
     ) -> list[dict[str, Any]]:
-        """组装 messages 数组。current_content 为字符串或多模态块列表。"""
+        """组装 messages 数组。current_content 为字符串或多模态块列表。
+
+        enable_memory=False 时跳过持久记忆检索与注入(Guest 模式用:
+        Guest 不持有任何永久记忆,仅靠 30 分钟临时上下文)。
+        """
         owner = scope_owner if scope_owner is not None else (
             user_id if scope == "user" else chat_id
         )
@@ -387,12 +392,14 @@ class ContextBuilder:
         if extra_system:
             system_text += "\n" + extra_system
 
-        # 持久记忆
-        memories = await self._daos.memories.search(scope, owner, query_text,
-                                                    top_k=self._memory_top_k)
-        if memories:
-            mem_lines = "\n".join(f"- {m.text}" for m in memories)
-            system_text += f"\n\n[长期记忆]\n{mem_lines}"
+        # 持久记忆(enable_memory=False 时跳过:Guest 无永久记忆)
+        memories: list = []
+        if enable_memory:
+            memories = await self._daos.memories.search(scope, owner, query_text,
+                                                        top_k=self._memory_top_k)
+            if memories:
+                mem_lines = "\n".join(f"- {m.text}" for m in memories)
+                system_text += f"\n\n[长期记忆]\n{mem_lines}"
 
         # 历史摘要
         summary = await self._daos.summaries.latest(chat_id)

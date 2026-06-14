@@ -3,11 +3,12 @@
 Bot API 10.0:Update.guest_message 投递召唤消息(aiogram 3.28 原生支持);
 鉴权按召唤者 guest_bot_caller_user(AuthMiddleware 的 extract_actor 已处理)。
 
-上下文模型:Guest 落库 + 30 分钟自动清空。
-- 每次召唤把消息(含回复关系元数据)写入 messages 表;
-- 下次召唤在 30 分钟内 → ContextBuilder 读到上一轮上下文(短期持续记忆);
+上下文模型:Guest **不保存任何永久记忆**,仅有 30 分钟临时上下文。
+- 每次召唤把消息(含回复关系元数据)写入 messages 表(短期上下文);
+- 下次召唤在 30 分钟内 → ContextBuilder 读到上一轮上下文(临时持续记忆);
 - 超过 30 分钟无活动 → pipeline 入口的 auto_clear 懒检查清空(空会话自动跳过);
-- scope=chat 记忆仍然积累(不受 30 分钟清空影响)。
+- 永久记忆彻底关闭:不注册 save_memory/search_memory 工具、不抽取记忆、
+  /remember 与 /forget 命令返回提示。Guest 清空时一并清理残留 scope=chat 记忆。
 
 注:Guest 模式的 guest_message 仅投递相册首帧(Telegram 平台限制),
 故 Guest 场景不支持多图相册,单图处理即可。
@@ -88,10 +89,12 @@ async def process_guest_message(message: Message, user: User, svc: Services) -> 
                                 reply_to_message_id=message.message_id,
                                 typing_refresh_s=svc.settings.typing_refresh_s)
 
-    # Guest 现在落库:实现「短期持续记忆 + 30 分钟自动清空」语义。
+    # Guest 现在落库:实现「临时上下文 + 30 分钟自动清空」语义。
     # 召唤 N → 召唤 N+1 在 30 分钟内可读到上一轮上下文;超过 30 分钟无活动
     # 由 pipeline 的 auto_clear 懒检查清空。用户也可手动 /reset 立即清空。
-    # 记忆走 scope=chat(与群聊隔离:Guest 与群聊共享 chat_id,但 histories 由 scope 分隔)。
+    # ★ enable_memory=False:Guest 不保存任何永久记忆 —— 工具集剔除记忆工具、
+    #   不抽取/不注入记忆,/remember 与 /forget 命令被禁用。
     await run_chat_pipeline(svc, user, message, content, renderer,
                             scope="chat", query_text=query_text,
-                            persist=True, auto_clear=True)
+                            persist=True, auto_clear=True,
+                            enable_memory=False)

@@ -64,12 +64,12 @@ def extract_target(message: Message, args: str) -> int | None:
 def _target_display_lines(tu: User | None, fallback_id: int) -> list[str]:
     """格式化目标用户显示行(grant/revoke/setquota 等结果共用)。"""
     if tu is None:
-        return [f"· ID:<code>{fallback_id}</code>"]
-    lines = [f"· ID:<code>{tu.tg_id}</code>"]
+        return [f"· ID: <code>{fallback_id}</code>"]
+    lines = [f"· ID: <code>{tu.tg_id}</code>"]
     if tu.first_name:
-        lines.append(f"· 名称:{tu.first_name}")
+        lines.append(f"· 名称: {tu.first_name}")
     if tu.username:
-        lines.append(f"· 用户名:@{tu.username}")
+        lines.append(f"· 用户名: @{tu.username}")
     return lines
 
 
@@ -147,7 +147,7 @@ async def logic_userinfo(svc: Services, actor: User, target: int) -> str:
     """查看目标用户的身份、授权状态与配额(管理员用)。"""
     tu = await svc.daos.users.get(target)
     if tu is None:
-        return f"⚠️ 用户 <code>{target}</code> 不存在(尚未与 Bot 交互过)"
+        return f"⚠️ 用户 <code>{target}</code> 不存在 (尚未与 Bot 交互过)"
 
     role_label = {"superadmin": "超级管理员", "admin": "管理员", "user": "普通用户"}.get(
         tu.role, tu.role,

@@ -274,3 +274,47 @@ def test_config_auto_clear_default_30():
 def test_config_auto_clear_override():
     s = Settings(_env_file=None, minimax_api_keys="k", auto_clear_minutes=60)
     assert s.auto_clear_minutes == 60
+
+
+# ── clear_chat 的 scope/owner 参数(Guest 残留记忆清理) ────────────
+async def test_clear_chat_without_scope_keeps_memories(daos: DAOBundle):
+    """无 scope/owner(Private/Group /reset):只清 messages+summaries,保留长期记忆。"""
+    await daos.messages.add(100, 1, "user", "你好", tokens=1)
+    await daos.summaries.add(100, "旧摘要", 1, 5)
+    await daos.memories.add("user", 1, "用户偏好猫")
+
+    await daos.messages.clear_chat(100)
+
+    assert await daos.messages.last_activity(100) is None
+    assert await daos.summaries.latest(100) is None
+    # 记忆保留
+    mems = await daos.memories.search("user", 1, "猫")
+    assert any("猫" in m.text for m in mems)
+
+
+async def test_clear_chat_with_scope_deletes_memories(daos: DAOBundle):
+    """带 scope/owner(Guest 清空):messages + summaries + 该范围记忆全清。"""
+    await daos.messages.add(200, 1, "user", "Guest 消息", tokens=1)
+    await daos.summaries.add(200, "Guest 摘要", 1, 5)
+    await daos.memories.add("chat", 200, "Guest 残留记忆")
+
+    await daos.messages.clear_chat(200, scope="chat", owner=200)
+
+    assert await daos.messages.last_activity(200) is None
+    assert await daos.summaries.latest(200) is None
+    # Guest scope 记忆被清理
+    mems = await daos.memories.search("chat", 200, "残留")
+    assert len(mems) == 0
+
+
+async def test_clear_chat_with_scope_only_deletes_matching_scope(daos: DAOBundle):
+    """带 scope 清理时,不影响其他 scope 的记忆(隔离)。"""
+    await daos.memories.add("chat", 200, "Guest 记忆")
+    await daos.memories.add("user", 1, "私聊记忆")
+
+    await daos.messages.clear_chat(200, scope="chat", owner=200)
+
+    assert len(await daos.memories.search("chat", 200, "")) == 0
+    # user scope 记忆不受影响
+    user_mems = await daos.memories.search("user", 1, "私聊")
+    assert any("私聊记忆" in m.text for m in user_mems)

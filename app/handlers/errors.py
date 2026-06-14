@@ -25,18 +25,18 @@ async def on_error(event: ErrorEvent) -> bool:
 
     if isinstance(exc, AllKeysFailedError):
         user_text = exc.user_message()
-        log.error("全局异常:所有MiniMax Key失败", 会话=chat_id,
+        log.error("全局异常: 所有MiniMax Key失败", 会话=chat_id,
                   尝试明细=len(exc.attempts))
     elif isinstance(exc, MiniMaxError):
         user_text = exc.user_message()
-        log.error("全局异常:MiniMax业务错误", 会话=chat_id, 错误码=exc.code,
+        log.error("全局异常: MiniMax业务错误", 会话=chat_id, 错误码=exc.code,
                   详情=exc.msg, 追踪ID=exc.trace_id)
     elif isinstance(exc, AllProvidersFailed):
         user_text = exc.user_message()
-        log.error("全局异常:搜索全败", 会话=chat_id, 查询=exc.query[:80])
+        log.error("全局异常: 搜索全败", 会话=chat_id, 查询=exc.query[:80])
     else:
         user_text = "⚠️ 处理消息时出现内部错误,请稍后重试。"
-        log.error("全局异常:未分类", 会话=chat_id, 异常类型=type(exc).__name__,
+        log.error("全局异常: 未分类", 会话=chat_id, 异常类型=type(exc).__name__,
                   详情=str(exc)[:300], exc_info=exc)
 
     if msg is not None:

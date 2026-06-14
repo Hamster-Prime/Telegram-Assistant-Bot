@@ -56,3 +56,28 @@ def test_generate_video_description_targets_async_faking():
     desc = _tool_description("generate_video")
     assert "后台生成中" in desc
     assert "tool_call" in desc
+
+
+def test_tools_without_memory_excludes_memory_tools():
+    """tools_without_memory 必须剔除 save_memory / search_memory(Guest 用)。"""
+    from app.core.tools import tools_without_memory
+
+    filtered = tools_without_memory()
+    names = {t["function"]["name"] for t in filtered}
+    assert "save_memory" not in names
+    assert "search_memory" not in names
+    # 其他工具保留(含本地工具与生成/搜索工具)
+    assert "get_current_time" in names
+    assert "web_search" in names
+    assert "generate_image" in names
+
+
+def test_tools_without_memory_does_not_mutate_global():
+    """过滤不得修改全局 TOOL_SCHEMAS(每次返回新列表)。"""
+    from app.core.tools import TOOL_SCHEMAS, tools_without_memory
+
+    before = {t["function"]["name"] for t in TOOL_SCHEMAS}
+    _ = tools_without_memory()
+    after = {t["function"]["name"] for t in TOOL_SCHEMAS}
+    assert before == after
+    assert "save_memory" in after  # 全局仍含记忆工具

@@ -213,3 +213,25 @@ async def test_compaction_skips_small_history(daos: DAOBundle):
     compactor = Compactor(daos, fake, summary_model="m")
     done = await compactor.maybe_compact(100, budget=128000)
     assert not done and fake.called == 0
+
+
+# ── enable_memory(Guest 模式):跳过持久记忆注入 ──────────────────
+async def test_context_disable_memory_skips_injection(daos: DAOBundle):
+    """enable_memory=False 时,即使数据库有记忆也不注入(Guest 无永久记忆)。"""
+    await daos.memories.add("chat", 200, "用户偏好猫")
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(200, 1, "你好", scope="chat", scope_owner=200,
+                          query_text="偏好", enable_memory=False)
+    sys_text = msgs[0]["content"]
+    assert "[长期记忆]" not in sys_text
+    assert "用户偏好猫" not in sys_text
+
+
+async def test_context_enable_memory_default_injects(daos: DAOBundle):
+    """默认(enable_memory=True)正常注入记忆(Private/Group 行为不变)。"""
+    await daos.memories.add("user", 1, "用户在北京")
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "天气", query_text="北京")
+    sys_text = msgs[0]["content"]
+    assert "[长期记忆]" in sys_text
+    assert "用户在北京" in sys_text

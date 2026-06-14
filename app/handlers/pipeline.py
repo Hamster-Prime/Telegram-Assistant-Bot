@@ -9,7 +9,7 @@ from aiogram.types import Message
 
 from app.core.delivery import DirectDelivery, GuestDelivery, MediaDelivery
 from app.core.streaming import GuestRenderer, StreamRenderer
-from app.core.tools import ToolDispatcher
+from app.core.tools import ToolDispatcher, tools_without_memory
 from app.db.models import User
 from app.handlers.media import ReferenceAssets
 from app.handlers.mentions import strip_bot_mention
@@ -25,12 +25,16 @@ def build_dispatcher(
     svc: Services, user: User, chat_id: int, scope: str, scope_owner: int,
     delivery: MediaDelivery | None = None,
     references: ReferenceAssets | None = None,
+    *,
+    enable_memory: bool = True,
 ) -> ToolDispatcher:
     """构造绑定了 user/chat 上下文的工具分发表。
 
     delivery 决定媒体投递方式:None/Direct=直发(私聊/群聊);Guest=暂存到 renderer。
     references 携带当前消息及被回复消息中的参考素材(图片/音频),
     供图生图/图生视频/音色复刻等工具自动使用。
+    enable_memory=False 时(Guest)不注册 save_memory/search_memory:
+    模型即便误调也找不到入口,确保 Guest 不写入或读取任何永久记忆。
     """
     if delivery is None:
         delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
@@ -311,8 +315,9 @@ def build_dispatcher(
     d.register("list_voices", list_voices)
     d.register("web_search", web_search)
     d.register("web_fetch", web_fetch)
-    d.register("save_memory", save_memory)
-    d.register("search_memory", search_memory)
+    if enable_memory:
+        d.register("save_memory", save_memory)
+        d.register("search_memory", search_memory)
     return d
 
 
@@ -376,12 +381,15 @@ async def run_chat_pipeline(
     query_text: str = "",
     persist: bool = True,
     auto_clear: bool = False,
+    enable_memory: bool = True,
 ) -> None:
     """统一对话管道:配额预检 → 并发槽 → 上下文 → Agent → 落库/结算/压缩/记忆。
 
     auto_clear:仅 Guest 启用 —— 进入管道前懒检查 30 分钟无活动则清空上下文,
     实现 Guest 的「短期持续记忆 + 自动过期」语义。Private/Group 不启用,
     由 compaction + /reset 管理上下文。
+    enable_memory:False 时(Guest)彻底关闭永久记忆 —— 不注册记忆工具、
+    不注入历史记忆、不做自动抽取,模型既无法写也无法读永久记忆。
     """
     chat_id = message.chat.id
     scope_owner = user.tg_id if scope == "user" else chat_id
@@ -394,7 +402,10 @@ async def run_chat_pipeline(
             idle_s = int(time.time()) - last_ts
             if idle_s > svc.settings.auto_clear_minutes * 60:
                 async with svc.user_lock.for_user(user.tg_id):
-                    await svc.daos.messages.clear_chat(chat_id)
+                    # Guest 超时清空:messages + summaries + 该 chat 的 scope 记忆残留
+                    # (Guest 本不应有记忆,这里清理旧版本/历史残留,兑现"清空即失效")。
+                    await svc.daos.messages.clear_chat(
+                        chat_id, scope=scope, owner=scope_owner)
                 log.info("Guest 超时自动清空上下文", 会话=chat_id,
                          空闲分钟=idle_s // 60)
 
@@ -418,6 +429,7 @@ async def run_chat_pipeline(
         messages = await svc.context.build(
             chat_id, user.tg_id, content,
             scope=scope, scope_owner=scope_owner, query_text=query_text,
+            enable_memory=enable_memory,
         )
 
         show_thinking = False
@@ -435,8 +447,13 @@ async def run_chat_pipeline(
         from app.handlers.media import extract_references
         references = await extract_references(svc, message)
         dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner,
-                                      delivery, references=references)
+                                      delivery, references=references,
+                                      enable_memory=enable_memory)
+        # Guest(enable_memory=False):从工具 schema 中剔除记忆工具,
+        # 让模型根本看不到这两个工具,杜绝调用尝试。
+        active_tools = tools_without_memory() if not enable_memory else None
         result = await svc.agent.run(messages, renderer, dispatcher,
+                                     tools=active_tools,
                                      show_thinking=show_thinking)
 
     # ── 后处理(不阻塞用户) ────────────────────────────────
@@ -469,7 +486,8 @@ async def run_chat_pipeline(
     if persist:
         async def _post() -> None:
             await svc.compactor.maybe_compact(chat_id, chat_row.token_budget)
-            if query_text and result.text:
+            # Guest(enable_memory=False):不抽取/写入永久记忆。
+            if enable_memory and query_text and result.text:
                 await svc.memory.auto_extract(scope, scope_owner, query_text, result.text)
 
         svc.registry.spawn(_post(), name=f"post-{chat_id}-{user.tg_id}")

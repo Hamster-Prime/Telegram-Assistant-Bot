@@ -19,12 +19,9 @@ from aiogram.types import (
 
 from app.db.models import User
 from app.handlers.commands import (
-    _scope_of,
     _split_command,
-    logic_forget,
     logic_help,
     logic_quota,
-    logic_remember,
     logic_reset,
     logic_start,
     logic_whoami,
@@ -93,7 +90,7 @@ async def execute_guest_command(
         info = extract_target_info(message, args)
         if info is None:
             return ("ℹ️ 请先回复目标用户的消息,或提供用户 ID\n"
-                    "例如:回复对方消息后发送 @bot /grant")
+                    "例如: 回复对方消息后发送 @bot /grant")
         target = info.tg_id
         if cmd == "grant":
             return await logic_grant(
@@ -114,7 +111,7 @@ async def execute_guest_command(
             try:
                 limit = int(rest[1])
             except ValueError:
-                return "参数错误:上限必须是数字"
+                return "参数错误: 上限必须是数字"
             period = rest[2] if len(rest) > 2 and rest[2] in ("day", "month", "total") else "day"
             return await logic_setquota(svc, user, target, rest[0], limit, period)
         if cmd == "resetquota":
@@ -134,7 +131,7 @@ async def execute_guest_command(
     # 分页列表命令:Guest inline 消息键盘状态脆弱,提示去私聊
     if cmd in _PRIVATE_ONLY_CMDS:
         return ("ℹ️ 列表视图请在与我的私聊中发送 "
-                f"<code>/{cmd}</code> 查看(支持翻页)。")
+                f"<code>/{cmd}</code> 查看 (支持翻页)。")
 
     chat_id = message.chat.id
     if cmd == "start":
@@ -144,14 +141,14 @@ async def execute_guest_command(
     if cmd == "whoami":
         return await logic_whoami(svc, user)
     if cmd == "reset":
-        return await logic_reset(svc, user, chat_id)
+        # Guest /reset:清理临时上下文 + 该 chat 的残留记忆(Guest 不应有永久记忆)。
+        return await logic_reset(svc, user, chat_id, scope="chat", owner=chat_id)
     if cmd == "quota":
         return await logic_quota(svc, user)
     if cmd in ("remember", "forget"):
-        scope, owner = _scope_of(message, user)
-        if cmd == "remember":
-            return await logic_remember(svc, user, scope, owner, args)
-        return await logic_forget(svc, user, scope, owner, args)
+        # Guest 模式不保存任何永久记忆 —— 显式禁用记忆命令。
+        return ("ℹ️ Guest 模式不保存永久记忆,仅保留 30 分钟内的临时上下文。\n"
+                "如需长期记忆,请到与我的私聊中使用 /remember")
 
     log.debug("Guest 未知命令,落入 AI 流程", 命令=cmd, 用户=user.tg_id)
     return None

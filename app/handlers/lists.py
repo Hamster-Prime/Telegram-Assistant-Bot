@@ -370,9 +370,9 @@ async def render_quota_status_html(svc: Services, user: User) -> str:
     """
     quotas = await svc.daos.quotas.get_all(user.tg_id)
     if user.is_superadmin:
-        return "<b>配额</b>  ♾️ 无限(超级管理员)"
+        return "<b>配额</b>  ♾️ 无限 (超级管理员)"
     if not quotas:
-        return "<b>配额</b>  未设置(不限)"
+        return "<b>配额</b>  未设置 (不限)"
     now_ts = int(time.time())
     lines = []
     for q in quotas:
@@ -532,7 +532,7 @@ def render_mmx_quota(key_idx: int, key: str, remains: list[QuotaRemain]) -> str:
     """
     head = f"<b>📊 Token Plan 用量</b>  账号{key_idx + 1} · <code>{mask_key(key)}</code>"
     if not remains:
-        return f"{head}\n\n<i>该账号暂无可用资源(可能非 Token Plan 订阅)。</i>"
+        return f"{head}\n\n<i>该账号暂无可用资源 (可能非 Token Plan 订阅)。</i>"
 
     # 周期范围(取首条的周窗口时间)
     w_start = _fmt_date(remains[0].weekly_start)
