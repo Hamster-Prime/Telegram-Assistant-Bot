@@ -284,7 +284,7 @@ async def test_guest_renderer_only_first_media_attached(limiter):
     await r.finalize("x")
 
 
-# ── 统一轮询循环:内容更新与闪烁共用间隔 ───────────────────
+# ── 统一轮询循环:内容更新与状态行共用间隔 ───────────────────
 
 async def test_tick_loop_updates_content(limiter):
     """update() 暂存文本,轮询循环在下一个 tick 编辑它。"""
@@ -300,24 +300,21 @@ async def test_tick_loop_updates_content(limiter):
     await r.finalize("新内容完成")
 
 
-async def test_tick_loop_cursor_blinks_when_idle(limiter):
-    """内容写入不带光标;静默时翻转后缀光标闪烁。"""
+async def test_idle_period_no_edits(limiter):
+    """内容静默(idle)期间不再产生编辑 —— 缓解 429 的核心。"""
     bot = GuestFakeBot()
     r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
                       limiter=limiter, throttle_ms=1)
     await r.start()
     await r.update("固定文本")
-    await asyncio.sleep(0.05)  # 让轮询循环 tick 多次(内容更新 + 闪烁)
-    # 应有多条编辑(内容更新 + 后续闪烁)
-    assert len(bot.text_edits) >= 2
-    # 首次编辑是内容写入,必须不带光标
-    assert "固定文本" in bot.text_edits[0][0]
-    assert not bot.text_edits[0][0].endswith(" ▌")
-    # 后续静默编辑:一些带光标,一些不带(翻转)
-    with_cursor = [e for e in bot.text_edits if e[0].endswith(" ▌")]
-    without_cursor = [e for e in bot.text_edits if not e[0].endswith(" ▌")]
-    assert len(with_cursor) >= 1
-    assert len(without_cursor) >= 1
+    await asyncio.sleep(0.03)  # 让内容写入落地
+    edits_after_content = len(bot.text_edits)
+    assert edits_after_content >= 1
+    # 等待多个 tick 过去(无新内容、无 set_status)
+    await asyncio.sleep(0.08)
+    # 编辑计数不应增长(idle 不闪烁)
+    assert len(bot.text_edits) == edits_after_content, (
+        "idle 期间不应产生编辑")
     await r.finalize("固定文本")
 
 
@@ -338,59 +335,39 @@ async def test_tick_loop_respects_interval(limiter):
     assert len(bot.edits) <= 5
 
 
-# ── 光标行为:占位闪烁 / 内容无光标 / 写后必亮 ─────────────────
+# ── 状态行:占位/内容渲染(idle 不发编辑)─────────────────
 
-async def test_placeholder_blinks_before_first_content(limiter):
-    """首条内容到达前,占位消息整条光标 ▌ ↔ nbsp 交替闪烁。"""
+async def test_placeholder_shows_status_line(limiter):
+    """首条内容前,占位消息显示状态行文本(默认「正在思考 ...」),不再 ▌/nbsp 交替。"""
     bot = FakeBot()
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=10,
                      typing_refresh_s=10)
-    await r.start()  # 占位发送 "▌",_cursor_on=True
-    # 不调用 update,让占位阶段闪烁多次(interval=10ms)
-    await asyncio.sleep(0.055)
+    await r.start()  # 占位发送 "▌"(sendMessage,记入 bot.sent)
+    # 占位阶段改状态,让 tick 落地状态行
+    await r.set_status("正在思考 ...")
+    await asyncio.sleep(0.04)
     await r.finalize("▌")  # 停止 tick;传占位字符避免影响断言
-    # 取出文本编辑(排除 send 占位)
+    # 文本编辑(排除 send 占位)应含状态行,不应出现纯 nbsp 闪烁
     edits_text = [e[2] for e in bot.edits]
-    on_off = [t for t in edits_text if t in ("▌", "\u00a0")]
-    assert len(on_off) >= 2, f"应有多于一次占位闪烁,实际 {on_off}"
-    # 应同时存在亮态 ▌ 与灭态 nbsp(交替)
-    assert "▌" in on_off
-    assert "\u00a0" in on_off
+    assert any("正在思考 ..." in t for t in edits_text), (
+        f"占位阶段应显示状态行,实际编辑 {edits_text}")
+    assert " " not in edits_text, "不应再有 nbsp 占位闪烁"
 
 
-async def test_content_edit_has_no_cursor_suffix(limiter):
-    """内容写入编辑不含光标后缀 " ▌"。"""
+async def test_content_edit_has_status_line_suffix(limiter):
+    """内容写入编辑:正文 + 空行 + 状态行,无光标后缀。"""
     bot = GuestFakeBot()
     r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
                       limiter=limiter, throttle_ms=1)
     await r.start()
     await r.update("正文内容")
-    await asyncio.sleep(0.02)  # 让内容写入 tick 落地
-    # 首次编辑是内容写入,无光标
+    await asyncio.sleep(0.02)
     assert bot.text_edits, "应有一次内容写入编辑"
     first = bot.text_edits[0][0]
     assert "正文内容" in first
-    assert not first.endswith(" ▌")
+    assert "▌" not in first, "不应含光标"
+    assert "正在思考 ..." in first, "应含默认状态行"
     await r.finalize("正文内容完成")
-
-
-async def test_cursor_bright_after_content_write(limiter):
-    """写完内容后,首个静默闪烁编辑必带亮光标 " ▌"。"""
-    bot = GuestFakeBot()
-    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
-                      limiter=limiter, throttle_ms=1)
-    await r.start()
-    await r.update("一段文字")
-    await asyncio.sleep(0.02)  # 内容写入落地(_cursor_on 被置 False)
-    # 内容写入编辑(无光标)应在
-    content_edits = [e for e in bot.text_edits if "一段文字" in e[0]
-                     and not e[0].endswith(" ▌")]
-    assert content_edits, "应先有一次无光标的内容写入"
-    await asyncio.sleep(0.03)  # 静默闪烁 tick
-    # 紧随其后的闪烁编辑必须带亮光标
-    bright = [e for e in bot.text_edits if e[0].endswith(" ▌")]
-    assert bright, "写完内容后下一个闪烁应带亮光标"
-    await r.finalize("一段文字完成")
 
 
 async def test_ensure_interval_elapsed_enforces_gap(limiter):
@@ -418,16 +395,21 @@ async def test_ensure_interval_elapsed_enforces_gap(limiter):
 
 
 async def test_finalize_enforces_interval_after_recent_edit(limiter):
-    """finalize 紧随末次编辑时由咽喉点补齐,定稿编辑距上次 ≥ interval。"""
+    """finalize 紧随末次编辑时由咽喉点补齐,定稿编辑距上次 ≥ interval。
+
+    注:idle 不再发编辑(Task 3 后),_last_edit_time 不被空闲 tick 刷新。
+    本测试用极短 throttle + 紧凑 update→finalize 时序构造「末次编辑刚发生」
+    的稳定场景,断言咽喉点 _ensure_interval_elapsed 触发补齐 sleep。
+    """
     bot = GuestFakeBot()
     r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
                       limiter=limiter, throttle_ms=100)
     await r.start()
     await r.update("内容")
-    # 等待内容写入 tick 落地(interval≈100ms,需略多)
-    await asyncio.sleep(0.12)
+    # 让内容写入 tick 落地(_last_edit_time 被记为「刚刚」)
+    await asyncio.sleep(0.02)
     assert len(bot.text_edits) >= 1, "应已写入内容"
-    # 立即 finalize:距末次编辑(约 20ms 前)< interval,必须补齐
+    # 立即 finalize:距末次编辑(约 2ms 前)<< interval,必须补齐到 ≥100ms
     t_before = time.monotonic()
     await r.finalize("内容完成")
     elapsed = time.monotonic() - t_before
@@ -612,7 +594,7 @@ async def test_set_status_drives_status_line(limiter):
     await r.set_status("正在搜索 ...")
     await r.update("正文内容")
     await asyncio.sleep(0.03)  # 让 tick 落地
-    # 内容写入编辑应同时含正文与状态行(后续 idle 闪烁不带状态行)
+    # 内容写入编辑应同时含正文与状态行
     assert bot.text_edits, "应有编辑落地"
     content_edits = [e[0] for e in bot.text_edits
                      if "正文内容" in e[0] and "正在搜索 ..." in e[0]]
