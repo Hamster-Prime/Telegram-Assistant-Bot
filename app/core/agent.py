@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.streaming import StreamRenderer
+from app.core.streaming import _STATUS_THINKING, StreamRenderer, _status_for_tool
 from app.core.tools import TOOL_SCHEMAS, ToolDispatcher
 from app.logging import get_logger
 from app.minimax.chat import ChatAPI
@@ -58,6 +58,9 @@ class Agent:
             pending_calls = []
             finish = ""
 
+            # 每轮流式开始前显示「正在处理」(首轮亦然,占位阶段即可见)
+            await renderer.set_status(_STATUS_THINKING)
+
             try:
                 async for ev in self._chat.stream_chat(convo, tools=tools):
                     if ev.kind == "content":
@@ -101,6 +104,8 @@ class Agent:
                     result.text = combined
                     return result
                 result.tool_rounds += 1
+                # 即将执行工具:按首个工具名设置状态行(立即渲染为「正在搜索」等)
+                await renderer.set_status(_status_for_tool(pending_calls[0].name))
                 # assistant 消息(含 tool_calls)入会话 —— 供模型下一轮看到完整工具历史
                 convo.append({
                     "role": "assistant",

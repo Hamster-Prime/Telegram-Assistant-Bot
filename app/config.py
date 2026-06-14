@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # 编辑节流(按场景,贴近 Telegram 硬限避免 429):
     #   单聊/Guest inline ≤1 条/秒 → EDIT_THROTTLE_MS=1000
     #   群聊 ≤20 条/分钟 ≈3 秒/次 → GROUP_EDIT_THROTTLE_MS=3000
-    # 该间隔是「同一消息任意两次编辑(内容更新或光标闪烁)的最短间隔」,
+    # 该间隔是「同一消息任意两次编辑(内容更新或状态行切换)的最短间隔」,
     # 由统一轮询循环强制执行。
     edit_throttle_ms: int = 1000
     group_edit_throttle_ms: int = 3000
