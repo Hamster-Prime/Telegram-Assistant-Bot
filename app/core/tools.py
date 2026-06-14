@@ -23,6 +23,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "根据文字描述生成图片(同步,数秒内完成)。"
                 "当用户消息中包含图片或回复了图片时,会自动进入图生图模式(以该图片人物为主体重新生成)。"
                 "可选画风预设(image-01-live 模型):漫画/元气/中世纪/水彩。"
+                "必须实际调用本工具生成;禁止仅用文字扮演已生成。"
             ),
             "parameters": {
                 "type": "object",
@@ -49,6 +50,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "当用户消息含图片时自动进入图生视频模式:"
                 "1张图→图生视频(首帧);2张图→首尾帧生成;设为 subject_reference→主体参考(S2V)。"
                 "调用后告知用户已开始,完成后另行发送。"
+                "必须实际调用本工具;禁止仅用文字扮演'已开始生成/后台生成中'而不发出 tool_call。"
             ),
             "parameters": {
                 "type": "object",
@@ -73,6 +75,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "把文本合成为语音并发送给用户(同步)。"
                 "可指定音色ID(系统音色或复刻/设计的自定义音色)、情绪、语言增强。"
+                "必须实际调用本工具合成;禁止仅用文字扮演已朗读。"
             ),
             "parameters": {
                 "type": "object",
@@ -93,7 +96,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "generate_music",
-            "description": "根据描述(可含歌词)生成歌曲/音乐(异步后台任务;调用后告知用户已开始)",
+            "description": "根据描述(可含歌词)生成歌曲/音乐(异步后台任务;调用后告知用户已开始)。必须实际调用本工具;禁止仅用文字扮演'已开始生成音乐'而不发出 tool_call。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -113,6 +116,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "音色复刻:根据用户发送或回复的语音/音频文件,克隆该音色。"
                 "调用前用户必须回复一条语音/音频消息(或直接发送)。"
                 "复刻得到的音色7天内需正式用于语音合成才会永久保留。"
+                "必须实际调用本工具;禁止仅用文字扮演'已完成复刻'。"
             ),
             "parameters": {
                 "type": "object",
@@ -134,6 +138,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "音色设计:根据文字描述生成一个全新的个性化音色。"
                 "如'低沉磁性的男声播音员'。返回音色ID和试听音频。"
+                "必须实际调用本工具;禁止仅用文字扮演'已设计完成'。"
             ),
             "parameters": {
                 "type": "object",
@@ -166,9 +171,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "联网搜索事实和最新信息。用户明确说“搜一下/查一下/帮我搜/最新/最近/新闻/动态”"
-                "或询问可能变化的现实信息时必须调用本工具。不要只承诺搜索;调用后基于结果回答。"
-                "返回标题/链接/摘要列表;需要详细正文时再用 web_fetch 抓取具体链接"
+                "你的训练知识有截止日期且可能过期。涉及任何现实世界实体"
+                "(人物/公司/产品/地点/政策/价格/版本/发布/新闻/数据等)的问题,"
+                "必须调用本工具搜索最新信息,无论用户是否明说“搜一下/查一下”。"
+                "不要只承诺搜索;调用后基于结果回答。"
+                "返回标题/链接/摘要列表;需要核对完整正文时再用 web_fetch 抓取具体链接。"
             ),
             "parameters": {
                 "type": "object",
@@ -185,7 +192,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "抓取指定 URL 的网页正文(markdown)",
+            "description": (
+                "抓取指定 URL 的网页正文(markdown)。"
+                "当 web_search 结果中的链接需要核对完整正文(数据/原文/规格/详情)时调用;"
+                "不要凭搜索摘要猜测细节。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {

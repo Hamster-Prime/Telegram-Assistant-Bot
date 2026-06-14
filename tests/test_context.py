@@ -44,6 +44,39 @@ async def test_system_prompt_requires_search_for_fresh_factual_questions(daos: D
     assert "不能只说" in system and "去搜索" in system
 
 
+async def test_system_prompt_forbids_faked_generation(daos: DAOBundle):
+    """系统提示必须禁止模型用文字扮演'已生成',逼其真实 emit tool_call。
+
+    回归:用户发图+要求生成视频,模型曾只输出'已开始生成/后台生成中'而未调用
+    generate_video。此测试锁定反伪造约束存在。
+    """
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "用这俩图生成视频", query_text="生成视频")
+    system = msgs[0]["content"]
+
+    assert "工具调用铁律" in system
+    assert "严禁" in system
+    assert "扮演" in system
+    assert "tool_call" in system
+    # 覆盖全部生成工具名,确保反伪造条款点名到视频
+    assert "generate_video" in system
+    assert "generate_image" in system
+
+
+async def test_system_prompt_requires_aggressive_search(daos: DAOBundle):
+    """激进搜索:训练知识有截止日期,现实世界实体问题一律先搜。"""
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "OpenAI 现在的 CEO 是谁", query_text="OpenAI CEO")
+    system = msgs[0]["content"]
+
+    assert "截止日期" in system
+    assert "默认搜索" in system
+    assert "现实世界实体" in system
+    # 给出免搜白名单(定义/历史/数学/闲聊),避免过度搜索
+    assert "纯定义" in system or "定义" in system
+
+
+
 async def test_system_prompt_instructs_direct_html_output(daos: DAOBundle):
     cb = ContextBuilder(daos)
     msgs = await cb.build(100, 1, "说明格式要求")
