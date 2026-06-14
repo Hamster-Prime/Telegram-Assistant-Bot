@@ -259,6 +259,10 @@ class DraftRenderer:
         self._typing_task = None
         self._typing_stop = None
 
+    async def set_status(self, status: str) -> None:
+        """私聊不渲染状态行(原生草稿预览无后缀概念);接受调用但不做任何事。"""
+        return
+
     async def update(self, full_text: str) -> None:
         if not self._throttle.should_commit(full_text):
             return

@@ -638,3 +638,14 @@ async def test_finalize_strips_status_line(limiter):
     assert bot.text_edits[-1][0] == "最终完整正文"
     assert "正在搜索" not in bot.text_edits[-1][0]
     assert r.last_rendered_text == "最终完整正文"
+
+
+async def test_draft_set_status_is_noop(limiter):
+    """私聊 DraftRenderer.set_status 是 no-op(不报错、不影响草稿)。"""
+    bot = FakeBot()
+    r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
+    await r.start()
+    await r.set_status("正在思考 ...")  # 不应抛异常
+    await r.update("草稿内容")
+    await r.finalize("草稿内容完成")
+    assert bot.sent[-1][1] == "草稿内容完成"
