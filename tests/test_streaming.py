@@ -620,3 +620,21 @@ async def test_placeholder_dedup_when_status_unchanged(limiter):
     await asyncio.sleep(0.03)
     assert any("正在搜索 ..." in e[0] for e in bot.text_edits), "状态变化应触发编辑"
     await r.finalize("x")
+
+
+async def test_finalize_strips_status_line(limiter):
+    """finalize 落地纯正文,不含状态行后缀;last_rendered_text 为纯正文。"""
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    await r.set_status("正在搜索 ...")
+    await r.update("流式正文片段")
+    await asyncio.sleep(0.02)  # tick 落地含状态行的中间编辑
+    # 末次中间编辑应含状态行(中间态)
+    assert "正在搜索 ..." in bot.text_edits[-1][0]
+    await r.finalize("最终完整正文")
+    # 定稿编辑为纯正文,不含状态行
+    assert bot.text_edits[-1][0] == "最终完整正文"
+    assert "正在搜索" not in bot.text_edits[-1][0]
+    assert r.last_rendered_text == "最终完整正文"
