@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 from app.core.streaming import EditRenderer
 from app.db.models import User
-from app.handlers.media import build_content
+from app.handlers.media import build_content, build_group_content
 from app.handlers.mentions import contains_bot_mention, strip_bot_mention
 from app.handlers.pipeline import run_chat_pipeline
 from app.handlers.replies import fold_reply_context
@@ -34,6 +34,20 @@ def _is_triggered(message: Message, bot_username: str, bot_id: int) -> bool:
                 F.text | F.photo | F.video | F.document | F.sticker | F.animation,
                 ~F.text.startswith("/"))
 async def handle_group(message: Message, user: User, svc: Services) -> None:
+    # 相册(media group)聚合
+    if getattr(message, "media_group_id", None):
+        async def _on_group_complete(messages: list[Message]) -> None:
+            me = await svc.bot.me()
+            if not any(_is_triggered(m, me.username or "", me.id) for m in messages):
+                return
+            await _process_group_album(svc, user, messages, me.username or "")
+
+        buffered = await svc.media_group_buffer.add_or_dispatch(
+            message, _on_group_complete,
+        )
+        if buffered:
+            return
+
     me = await svc.bot.me()
     if not _is_triggered(message, me.username or "", me.id):
         return  # 未被提及,忽略
@@ -58,8 +72,31 @@ async def handle_group(message: Message, user: User, svc: Services) -> None:
                             throttle_ms=svc.settings.group_edit_throttle_ms,
                             reply_to_message_id=message.message_id,
                             typing_refresh_s=svc.settings.typing_refresh_s)
-    # 群聊回复上下文同样折叠进 content(避免模型只看到主消息文本)。
     content, query_text = await fold_reply_context(svc, message, content, query_text)
-    # 群聊隐私隔离:scope=chat
+    await run_chat_pipeline(svc, user, message, content, renderer,
+                            scope="chat", query_text=query_text)
+
+
+async def _process_group_album(
+    svc: Services, user: User, messages: list[Message], bot_username: str,
+) -> None:
+    """处理群聊中聚合后的相册。"""
+    if not messages:
+        return
+    message = messages[0]
+    log.info("群聊相册(已聚合)", 用户=user.tg_id, 群=message.chat.id,
+             群名=message.chat.title or "?", 图片数=len(messages))
+
+    content, query_text, _urls = await build_group_content(svc, messages)
+    for blk in content:
+        if blk.get("type") == "text":
+            blk["text"] = strip_bot_mention(blk["text"], bot_username)
+    query_text = strip_bot_mention(query_text, bot_username)
+
+    renderer = EditRenderer(svc.bot, message.chat.id, svc.limiter,
+                            throttle_ms=svc.settings.group_edit_throttle_ms,
+                            reply_to_message_id=message.message_id,
+                            typing_refresh_s=svc.settings.typing_refresh_s)
+    content, query_text = await fold_reply_context(svc, message, content, query_text)
     await run_chat_pipeline(svc, user, message, content, renderer,
                             scope="chat", query_text=query_text)

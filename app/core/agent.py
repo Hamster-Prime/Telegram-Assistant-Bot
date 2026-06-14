@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +19,19 @@ from app.minimax.client import AllKeysFailedError, MiniMaxError
 log = get_logger("core.agent")
 
 MAX_TOOL_ROUNDS = 6  # 防工具循环失控
+
+# 匹配开头的 [时间 · 角色] 元数据前缀(模型可能模仿历史消息格式)
+_META_PREFIX_RE = re.compile(
+    r"^\s*\[[^\]\n]*·[^\]\n]*\][ \t]*\n?", re.MULTILINE
+)
+
+
+def _strip_meta_prefix(text: str) -> str:
+    """剥离模型可能模仿的 [时间 · 角色] 元数据前缀。
+
+    只剥离开头第一个匹配,不会误伤正文里的合法方括号(如 [链接])。
+    """
+    return _META_PREFIX_RE.sub("", text, count=1).lstrip()
 
 
 @dataclass(slots=True)
@@ -65,11 +79,11 @@ class Agent:
                 async for ev in self._chat.stream_chat(convo, tools=tools):
                     if ev.kind == "content":
                         full_text += ev.text
-                        display = full_text
+                        display = _strip_meta_prefix(full_text)
                         if show_thinking and reasoning_text:
                             display = (
                                 f"<blockquote expandable>\n{reasoning_text}"
-                                f"\n</blockquote>\n\n{full_text}"
+                                f"\n</blockquote>\n\n{display}"
                             )
                         await renderer.update(display)
                     elif ev.kind == "reasoning":
@@ -134,11 +148,11 @@ class Agent:
 
             # 正常结束
             result.text = full_text
-            display = full_text
+            display = _strip_meta_prefix(full_text)
             if show_thinking and result.reasoning:
                 display = (
                     f"<blockquote expandable>\n{result.reasoning}"
-                    f"\n</blockquote>\n\n{full_text}"
+                    f"\n</blockquote>\n\n{display}"
                 )
             await renderer.finalize(display or "(空回复)")
             # 终稿对账:末次编辑可能因限流/HTML错误未落地,消息停在较短中间状态。

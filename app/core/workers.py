@@ -24,6 +24,7 @@ from app.core.htmlfmt import sanitize_telegram_html
 from app.db.dao import DAOBundle
 from app.db.models import Generation, User
 from app.logging import get_logger
+from app.minimax.client import MiniMaxError
 
 if TYPE_CHECKING:
     from app.core.quota import QuotaManager
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 log = get_logger("core.workers")
 
 POLL_MAX_TOTAL_S = 600  # 轮询硬上限 10 分钟
+POLL_MAX_CONSECUTIVE_ERRORS = 3  # 连续查询错误上限:达到后终止轮询
 
 
 class GenWorkerPool:
@@ -70,33 +72,52 @@ class GenWorkerPool:
     async def submit_video(self, user: User, chat_id: int, prompt: str,
                            *, duration: int = 6, resolution: str = "768P",
                            placeholder_msg_id: int | None = None,
-                           inline_message_id: str | None = None) -> tuple[int, str]:
+                           inline_message_id: str | None = None,
+                           first_frame_image: str | None = None,
+                           last_frame_image: str | None = None,
+                           subject_reference: list[dict[str, Any]] | None = None,
+                           ) -> tuple[int, str]:
         """建视频任务并启动后台轮询。返回 (gen_id, task_id)。handler 快速返回。
 
         inline_message_id 非 None 时为 Guest 模式:回填写入该 inline 消息。
+        参考图参数决定模式:T2V / I2V(首帧) / FL2V(首尾帧) / S2V(主体参考)。
         """
         task_id = await self._video.create_task(
             prompt, duration=duration, resolution=resolution,
             callback_url=self._callback_url or None,
+            first_frame_image=first_frame_image,
+            last_frame_image=last_frame_image,
+            subject_reference=subject_reference,
         )
+        mode = ("S2V" if subject_reference
+                else "FL2V" if last_frame_image
+                else "I2V" if first_frame_image
+                else "T2V")
         gen = Generation(
             id=None, user_id=user.tg_id, chat_id=chat_id, kind="video",
-            model=self._video._model, prompt=prompt, status="processing",
+            model=self._video._model, prompt=f"[{mode}] {prompt}",
+            status="processing",
             task_id=task_id, placeholder_msg_id=placeholder_msg_id,
             inline_message_id=inline_message_id,
         )
         gen_id = await self._daos.generations.create(gen)
         self._registry.spawn(self._poll_video(gen_id, task_id, user),
                              name=f"poll-video-{gen_id}")
-        log.info("视频任务已提交后台", 生成编号=gen_id, 任务ID=task_id,
+        log.info("视频任务已提交后台", 模式=mode, 生成编号=gen_id, 任务ID=task_id,
                  用户=user.tg_id, 会话=chat_id,
                  投递方式="Guest-inline" if inline_message_id else "直发")
         return gen_id, task_id
 
     async def _poll_video(self, gen_id: int, task_id: str, user: User) -> None:
-        """兜底轮询(指数退避)。回调先到则发现 status 已终态,直接退出。"""
+        """兜底轮询(指数退避)。回调先到则发现 status 已终态,直接退出。
+
+        永久性错误(MiniMaxError non-retryable,如 2013 参数错误/图片太小)
+        立即标记失败终止,不浪费 600 秒。
+        连续查询错误(网络/临时)超过 POLL_MAX_CONSECUTIVE_ERRORS 也终止。
+        """
         interval = self._poll_interval
         waited = 0.0
+        consecutive_errors = 0
         while waited < POLL_MAX_TOTAL_S:
             await asyncio.sleep(interval)
             waited += interval
@@ -110,10 +131,41 @@ class GenWorkerPool:
 
             try:
                 status, file_id = await self._video.query_task(task_id)
+                consecutive_errors = 0  # 成功查询,重置计数
+            except MiniMaxError as e:
+                if not e.retryable:
+                    # 永久错误(2013 参数错误 / 1026 敏感内容等)→ 立即终止
+                    log.error("视频查询返回永久错误,终止轮询", 生成编号=gen_id,
+                              任务ID=task_id, 错误码=e.code, 详情=e.msg[:200])
+                    await self._fail_generation(
+                        gen_id, f"视频生成失败(MiniMax错误 {e.code}):{e.msg[:150]}",
+                        user)
+                    return
+                consecutive_errors += 1
+                log.warning("视频任务查询失败(可重试)", 生成编号=gen_id,
+                            任务ID=task_id, 错误码=e.code, 连续次数=consecutive_errors,
+                            详情=e.msg[:200], 已等待秒=round(waited))
+                if consecutive_errors >= POLL_MAX_CONSECUTIVE_ERRORS:
+                    log.error("连续查询错误超限,终止轮询", 生成编号=gen_id,
+                              任务ID=task_id, 连续错误数=consecutive_errors)
+                    await self._fail_generation(
+                        gen_id, f"视频查询连续失败 {consecutive_errors} 次,已终止",
+                        user)
+                    return
+                continue
             except Exception as e:
-                log.warning("视频任务查询失败(继续轮询)", 生成编号=gen_id,
+                consecutive_errors += 1
+                log.warning("视频任务查询异常(继续轮询)", 生成编号=gen_id,
                             任务ID=task_id, 异常类型=type(e).__name__,
+                            连续次数=consecutive_errors,
                             详情=str(e)[:200], 已等待秒=round(waited))
+                if consecutive_errors >= POLL_MAX_CONSECUTIVE_ERRORS:
+                    log.error("连续查询异常超限,终止轮询", 生成编号=gen_id,
+                              任务ID=task_id, 连续异常数=consecutive_errors)
+                    await self._fail_generation(
+                        gen_id, f"视频查询连续异常 {consecutive_errors} 次,已终止",
+                        user)
+                    return
                 continue
 
             if status == "success" and file_id:

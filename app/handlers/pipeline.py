@@ -11,6 +11,7 @@ from app.core.delivery import DirectDelivery, GuestDelivery, MediaDelivery
 from app.core.streaming import GuestRenderer, StreamRenderer
 from app.core.tools import ToolDispatcher
 from app.db.models import User
+from app.handlers.media import ReferenceAssets
 from app.handlers.mentions import strip_bot_mention
 from app.logging import get_logger
 from app.search.router import AllProvidersFailed
@@ -23,28 +24,48 @@ log = get_logger("handlers.pipeline")
 def build_dispatcher(
     svc: Services, user: User, chat_id: int, scope: str, scope_owner: int,
     delivery: MediaDelivery | None = None,
+    references: ReferenceAssets | None = None,
 ) -> ToolDispatcher:
     """构造绑定了 user/chat 上下文的工具分发表。
 
     delivery 决定媒体投递方式:None/Direct=直发(私聊/群聊);Guest=暂存到 renderer。
+    references 携带当前消息及被回复消息中的参考素材(图片/音频),
+    供图生图/图生视频/音色复刻等工具自动使用。
     """
     if delivery is None:
         delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
+    refs = references or ReferenceAssets()
     d = ToolDispatcher()
 
     async def generate_image(args: dict[str, Any]) -> str:
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("image"))
         if not check.ok:
             return check.denial_text()
+        # 参考图片:自动图生图(用户发送/回复了图片)
+        subject_ref: list[dict[str, Any]] | None = None
+        style: dict[str, Any] | None = None
+        model: str | None = None
+        if refs.images:
+            subject_ref = [{"type": "character", "image_file": refs.images[0]}]
+        # 画风预设 → image-01-live 模型
+        style_type = args.get("style_type")
+        if style_type:
+            model = "image-01-live"
+            style = {"style_type": style_type, "style_weight": 0.8}
+
         urls = await svc.image_api.generate(
             args["prompt"],
             aspect_ratio=args.get("aspect_ratio", "1:1"),
             n=int(args.get("n", 1)),
+            subject_reference=subject_ref,
+            model=model,
+            style=style,
         )
         if not urls:
             return "图片生成失败:未返回图片"
         total = len(urls)
         sent = 0
+        mode_tag = "图生图" if subject_ref else "文生图"
         for i, u in enumerate(urls):
             if delivery.is_guest:
                 # Guest 单 inline 消息:仅首张作为媒体,其余不展示(在 note 注明)
@@ -62,7 +83,7 @@ def build_dispatcher(
                     sent += 1
         await svc.quota.settle(user, "calls", svc.quota.call_weight("image"),
                                chat_id=chat_id, kind="image")
-        return f"已生成并发送 {sent} 张图片。"
+        return f"已生成并发送 {sent} 张图片({mode_tag})。"
 
     async def generate_video(args: dict[str, Any]) -> str:
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("video"))
@@ -76,14 +97,40 @@ def build_dispatcher(
             ph_msg_id = await delivery.send_placeholder(
                 "🎬 视频生成中,完成后会发到这里…")
             inline_id = None
+
+        # 参考图片自动选择模式
+        first_frame: str | None = None
+        last_frame: str | None = None
+        subject_ref: list[dict[str, Any]] | None = None
+        mode = "文生视频"
+        if refs.images:
+            ref_mode = args.get("reference_mode", "first_frame")
+            if ref_mode == "subject_reference" and refs.images:
+                # 主体参考 S2V:结构为 {type, image:[url]}
+                subject_ref = [{"type": "character",
+                                "image": [refs.images[0]]}]
+                mode = "主体参考视频"
+            elif len(refs.images) >= 2:
+                # 首尾帧 FL2V
+                first_frame = refs.images[0]
+                last_frame = refs.images[1]
+                mode = "首尾帧视频"
+            else:
+                # 单图 → 图生视频 I2V
+                first_frame = refs.images[0]
+                mode = "图生视频"
+
         gen_id, task_id = await svc.workers.submit_video(
             user, chat_id, args["prompt"],
             duration=int(args.get("duration", 6)),
             resolution=args.get("resolution", "768P"),
             placeholder_msg_id=ph_msg_id,
             inline_message_id=inline_id,
+            first_frame_image=first_frame,
+            last_frame_image=last_frame,
+            subject_reference=subject_ref,
         )
-        return ("视频生成任务已入队,正在后台生成,完成后会自动发送给用户。"
+        return (f"{mode}任务已入队,正在后台生成,完成后会自动发送给用户。"
                 "请告知用户可以继续聊其他话题。")
 
     async def synthesize_speech(args: dict[str, Any]) -> str:
@@ -94,6 +141,7 @@ def build_dispatcher(
             args["text"],
             voice_id=args.get("voice_id", "male-qn-qingse"),
             emotion=args.get("emotion"),
+            language_boost=args.get("language_boost"),
         )
         if not audio_url and not audio_bytes:
             return "语音合成失败:无音频返回"
@@ -124,6 +172,95 @@ def build_dispatcher(
         )
         return ("音乐生成任务已入队,正在后台生成,完成后会自动发送给用户。"
                 "请告知用户可以继续聊其他话题。")
+
+    async def clone_voice(args: dict[str, Any]) -> str:
+        check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("voice_clone"))
+        if not check.ok:
+            return check.denial_text()
+        if not refs.audio:
+            return ("音色复刻需要音频素材。请用户回复一条语音/音频消息,"
+                    "或直接发送音频文件后再试。")
+        # 上传承载音频 → 调用复刻接口
+        try:
+            file_id_str = await svc.files_api.upload(
+                refs.audio, refs.audio_filename or "clone.mp3",
+                purpose="voice_clone",
+            )
+            file_id = int(file_id_str)
+        except ValueError:
+            return "音频上传失败:无法获取有效的 file_id。"
+
+        voice_id = args["voice_id"]
+        preview_text = args.get("preview_text")
+        clone_prompt = None
+        result = await svc.voice_api.clone(
+            file_id, voice_id,
+            clone_prompt=clone_prompt,
+            text=preview_text,
+            model=svc.settings.model_tts if preview_text else None,
+        )
+        demo = result.get("demo_audio") or ""
+        msg = f"音色复刻成功!音色ID:<code>{voice_id}</code>。"
+        if demo:
+            # 发送试听音频
+            await delivery.send_voice(demo)
+            msg += "试听音频已发送。"
+        msg += "7天内用该音色合成一次语音即可永久保留。"
+        await svc.quota.settle(user, "calls", svc.quota.call_weight("voice_clone"),
+                               chat_id=chat_id, kind="voice_clone")
+        return msg
+
+    async def design_voice(args: dict[str, Any]) -> str:
+        check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("voice_design"))
+        if not check.ok:
+            return check.denial_text()
+        voice_id, trial_bytes = await svc.voice_api.design(
+            args["prompt"],
+            args["preview_text"],
+            voice_id=args.get("voice_id"),
+        )
+        msg = f"音色设计成功!音色ID:<code>{voice_id}</code>。"
+        if trial_bytes:
+            # 试听音频为 hex 解码后的原始字节,转投递
+            ok = await delivery.send_voice(None, trial_bytes)
+            if ok:
+                msg += "试听音频已发送。"
+            else:
+                msg += "试听音频已生成但当前场景无法投递。"
+        msg += "7天内用该音色合成一次语音即可永久保留。"
+        await svc.quota.settle(user, "calls", svc.quota.call_weight("voice_design"),
+                               chat_id=chat_id, kind="voice_design")
+        return msg
+
+    async def list_voices(args: dict[str, Any]) -> str:
+        voice_type = args.get("voice_type", "all")
+        data = await svc.voice_api.list_voices(voice_type)
+        lines: list[str] = []
+        sys_voices = data.get("system_voice") or []
+        if sys_voices:
+            lines.append("【系统音色】")
+            for v in sys_voices[:30]:
+                name = v.get("voice_name") or v.get("voice_id", "?")
+                vid = v.get("voice_id", "?")
+                desc = (v.get("description") or [""])[0][:40] if v.get("description") else ""
+                lines.append(f"• {name} → <code>{vid}</code>" + (f" ({desc})" if desc else ""))
+            if len(sys_voices) > 30:
+                lines.append(f"  …共 {len(sys_voices)} 个,已显示前 30")
+        cloned = data.get("voice_cloning") or []
+        if cloned:
+            lines.append("【复刻音色】")
+            for v in cloned:
+                lines.append(f"• <code>{v.get('voice_id', '?')}</code>"
+                             f" ({v.get('created_time', '?')})")
+        generated = data.get("voice_generation") or []
+        if generated:
+            lines.append("【设计音色】")
+            for v in generated:
+                lines.append(f"• <code>{v.get('voice_id', '?')}</code>"
+                             f" ({v.get('created_time', '?')})")
+        if not lines:
+            return f"未查询到 {voice_type} 类型的音色。"
+        return "\n".join(lines)
 
     async def web_search(args: dict[str, Any]) -> str:
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("search"))
@@ -169,6 +306,9 @@ def build_dispatcher(
     d.register("generate_video", generate_video)
     d.register("synthesize_speech", synthesize_speech)
     d.register("generate_music", generate_music)
+    d.register("clone_voice", clone_voice)
+    d.register("design_voice", design_voice)
+    d.register("list_voices", list_voices)
     d.register("web_search", web_search)
     d.register("web_fetch", web_fetch)
     d.register("save_memory", save_memory)
@@ -291,7 +431,11 @@ async def run_chat_pipeline(
             delivery: MediaDelivery = GuestDelivery(renderer)
         else:
             delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
-        dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner, delivery)
+        # 提取参考素材(当前消息 + 被回复消息中的图片/音频)
+        from app.handlers.media import extract_references
+        references = await extract_references(svc, message)
+        dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner,
+                                      delivery, references=references)
         result = await svc.agent.run(messages, renderer, dispatcher,
                                      show_thinking=show_thinking)
 

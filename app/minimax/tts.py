@@ -24,6 +24,7 @@ class TTSAPI:
         vol: float = 1.0,
         pitch: int = 0,
         emotion: str | None = None,
+        language_boost: str | None = None,
         audio_format: str = "mp3",
         sample_rate: int = 32000,
         output_format: str = "url",
@@ -31,6 +32,7 @@ class TTSAPI:
         """文本转语音。返回 (音频字节 | None, 音频URL | None, 时长毫秒)。
 
         默认 output_format=url 省去 hex 解码;url 模式下返回 (None, url, ms)。
+        language_boost:增强小语种/方言识别,如 "Chinese"、"English"、"auto"。
         """
         if len(text) > 10000:
             text = text[:10000]
@@ -42,7 +44,7 @@ class TTSAPI:
         if emotion:
             voice_setting["emotion"] = emotion
 
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._model,
             "text": text,
             "voice_setting": voice_setting,
@@ -52,8 +54,11 @@ class TTSAPI:
             },
             "output_format": output_format,
         }
+        if language_boost:
+            payload["language_boost"] = language_boost
         log.info("语音合成请求", 模型=self._model, 文本长度=len(text),
-                 音色=voice_id, 情绪=emotion or "默认", 输出格式=output_format)
+                 音色=voice_id, 情绪=emotion or "默认",
+                 语言增强=language_boost or "默认", 输出格式=output_format)
         data = await self._client.post("/t2a_v2", payload)
 
         audio_field = (data.get("data") or {}).get("audio", "")

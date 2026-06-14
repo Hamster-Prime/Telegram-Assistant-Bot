@@ -165,12 +165,17 @@ def _scope_of(message: Message, user: User) -> tuple[str, int]:
     return "chat", message.chat.id
 
 
-def _explicit_dispatcher(svc: Services, message: Message, user: User):
-    """显式命令复用的工具分发器(6 个生成/搜索命令共用)。"""
+def _explicit_dispatcher(svc: Services, message: Message, user: User, *,
+                         references=None):
+    """显式命令复用的工具分发器(生成/搜索命令共用)。
+
+    references:可选的参考素材(图片/音频),用于图生图/图生视频/音色复刻。
+    """
     from app.handlers.pipeline import build_dispatcher
 
     scope, owner = _scope_of(message, user)
-    return build_dispatcher(svc, user, message.chat.id, scope, owner)
+    return build_dispatcher(svc, user, message.chat.id, scope, owner,
+                            references=references)
 
 
 @router.message(Command("remember"))
@@ -475,9 +480,12 @@ async def cmd_audit(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("image"))
 async def cmd_image(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/image 图片描述")
+        await message.answer("用法:/image 图片描述\n"
+                             "💡 回复一张图片再用此命令可进行图生图")
         return
-    d = _explicit_dispatcher(svc, message, user)
+    from app.handlers.media import extract_references
+    refs = await extract_references(svc, message)
+    d = _explicit_dispatcher(svc, message, user, references=refs)
     result = await d.dispatch("generate_image", json.dumps({"prompt": command.args}))
     if "已生成" not in result:
         await message.answer(result)
@@ -486,9 +494,12 @@ async def cmd_image(message: Message, command: CommandObject, user: User, svc: S
 @router.message(Command("video"))
 async def cmd_video(message: Message, command: CommandObject, user: User, svc: Services) -> None:
     if not command.args:
-        await message.answer("用法:/video 视频描述")
+        await message.answer("用法:/video 视频描述\n"
+                             "💡 回复图片可进行图生视频(1张=首帧,2张=首尾帧)")
         return
-    d = _explicit_dispatcher(svc, message, user)
+    from app.handlers.media import extract_references
+    refs = await extract_references(svc, message)
+    d = _explicit_dispatcher(svc, message, user, references=refs)
     result = await d.dispatch("generate_video", json.dumps({"prompt": command.args}))
     if "已入队" not in result:
         await message.answer(result)
@@ -514,6 +525,45 @@ async def cmd_music(message: Message, command: CommandObject, user: User, svc: S
     result = await d.dispatch("generate_music", json.dumps({"prompt": command.args}))
     if "已入队" not in result:
         await message.answer(result)
+
+
+@router.message(Command("clone"))
+async def cmd_clone(message: Message, command: CommandObject, user: User, svc: Services) -> None:
+    if not command.args:
+        await message.answer("用法:回复一条语音/音频,发送 /clone 音色名\n"
+                             "💡 音色名8-256字符,首字符必须字母")
+        return
+    from app.handlers.media import extract_references
+    refs = await extract_references(svc, message)
+    d = _explicit_dispatcher(svc, message, user, references=refs)
+    result = await d.dispatch("clone_voice",
+                              json.dumps({"voice_id": command.args.strip()}))
+    await message.answer(result, parse_mode="HTML")
+
+
+@router.message(Command("voices"))
+async def cmd_voices(message: Message, command: CommandObject, user: User, svc: Services) -> None:
+    voice_type = (command.args or "all").strip().lower()
+    if voice_type not in ("system", "voice_cloning", "voice_generation", "all"):
+        voice_type = "all"
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("list_voices",
+                              json.dumps({"voice_type": voice_type}))
+    await message.answer(result[:4000], parse_mode="HTML")
+
+
+@router.message(Command("design_voice"))
+async def cmd_design_voice(message: Message, command: CommandObject, user: User, svc: Services) -> None:
+    if not command.args:
+        await message.answer("用法:/design_voice 音色描述\n"
+                             "示例:/design_voice 低沉磁性的男声播音员")
+        return
+    d = _explicit_dispatcher(svc, message, user)
+    result = await d.dispatch("design_voice", json.dumps({
+        "prompt": command.args,
+        "preview_text": "欢迎使用音色设计功能,这是试听音频。",
+    }))
+    await message.answer(result, parse_mode="HTML")
 
 
 @router.message(Command("search"))

@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     default_quota_mode: str = "tokens"  # tokens | calls
     default_quota_limit: int = 200_000  # -1 = 无限
     default_quota_period: str = "day"  # day | month | total
-    gen_call_weights: str = "image:1,video:5,music:5,tts:1,search:1,fetch:1"
+    gen_call_weights: str = "image:1,video:5,music:5,tts:1,voice_clone:1,voice_design:1,search:1,fetch:1"
 
     # ── 并发 / 背压 ────────────────────────────────────────────
     max_concurrent_chats: int = 32

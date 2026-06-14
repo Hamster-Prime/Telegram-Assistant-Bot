@@ -81,3 +81,22 @@ class FilesAPI:
         data = resp.content
         log.info("文件下载完成", 大小KB=round(len(data) / 1024, 1))
         return data
+
+    async def list(self, purpose: str | None = None, limit: int = 100) -> list[dict]:
+        """列出已上传文件。返回 file 信息列表。
+
+        purpose 可选过滤(如 voice_clone / file-extract);不传返回全部。
+        """
+        params: dict = {"limit": limit}
+        if purpose:
+            params["purpose"] = purpose
+        data = await self._client.get("/files/list", params=params)
+        files = data.get("files") or data.get("data") or []
+        log.info("文件列表查询", 数量=len(files), 用途=purpose or "全部")
+        return list(files)
+
+    async def delete(self, file_id: str) -> bool:
+        """删除指定文件。返回是否成功。"""
+        await self._client.get("/files/delete", params={"file_id": file_id})
+        log.info("文件已删除", 文件ID=file_id)
+        return True

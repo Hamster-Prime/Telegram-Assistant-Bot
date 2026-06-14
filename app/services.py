@@ -23,6 +23,7 @@ from app.minimax.music import MusicAPI
 from app.minimax.quota import QuotaAPI
 from app.minimax.tts import TTSAPI
 from app.minimax.video import VideoAPI
+from app.minimax.voice import VoiceAPI
 from app.search.brave import BraveProvider
 from app.search.duckduckgo import DuckDuckGoProvider
 from app.search.firecrawl import FirecrawlProvider
@@ -38,6 +39,10 @@ class Services:
     def __init__(self, settings: Settings, bot: Bot) -> None:
         self.settings = settings
         self.bot = bot
+
+        # 相册聚合缓冲(跨 handler 共享单例)
+        from app.handlers.media_group import MediaGroupBuffer
+        self.media_group_buffer = MediaGroupBuffer()
 
         # 数据库
         self.db = Database(settings.db_path, wal=settings.sqlite_wal)
@@ -65,6 +70,7 @@ class Services:
         self.video_api = VideoAPI(self.mmx, settings.model_video)
         self.music_api = MusicAPI(self.mmx, settings.model_music)
         self.files_api = FilesAPI(self.mmx)
+        self.voice_api = VoiceAPI(self.mmx)
         self.quota_api = QuotaAPI(self.mmx)
 
         # 搜索(独立 httpx 单例,与 MiniMax 隔离)
@@ -105,7 +111,7 @@ class Services:
             bot, self.daos, self.video_api, self.music_api, self.files_api,
             self.quota, self.guard, self.limiter, self.registry,
             poll_interval_s=settings.worker_poll_interval_s,
-            callback_url=settings.mmx_callback_url,
+            callback_url=settings.mmx_callback_url if settings.mode == "webhook" else "",
         )
 
     async def startup(self) -> None:

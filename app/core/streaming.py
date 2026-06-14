@@ -455,7 +455,7 @@ class _TickLoopMixin:
                         try:
                             await do_edit(rendered)
                         except Exception as e:
-                            log.warning("占位状态行编辑失败(忽略)", 错误=str(e)[:120])
+                            log.debug("占位状态行编辑失败(忽略)", 错误=str(e)[:120])
                 # 等到下一个 tick(或停止信号)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)

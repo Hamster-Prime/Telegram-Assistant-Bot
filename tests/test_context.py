@@ -102,10 +102,11 @@ async def test_history_message_has_sender_and_timestamp(daos: DAOBundle):
     assert user_hist["role"] == "user"
     assert "👤 Alice" in user_hist["content"]
     assert user_hist["content"].endswith("你好")
-    # assistant 历史消息:header 含 🤖 助理
+    # assistant 历史消息:不注入元数据头(避免模型模仿),content 为原始文本
     asst_hist = msgs[2]
     assert asst_hist["role"] == "assistant"
-    assert "🤖 助理" in asst_hist["content"]
+    assert "🤖 助理" not in asst_hist["content"]
+    assert asst_hist["content"] == "你好呀"
 
 
 async def test_history_message_shows_reply_snapshot(daos: DAOBundle):

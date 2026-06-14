@@ -8,6 +8,9 @@ Bot API 10.0:Update.guest_message 投递召唤消息(aiogram 3.28 原生支持);
 - 下次召唤在 30 分钟内 → ContextBuilder 读到上一轮上下文(短期持续记忆);
 - 超过 30 分钟无活动 → pipeline 入口的 auto_clear 懒检查清空(空会话自动跳过);
 - scope=chat 记忆仍然积累(不受 30 分钟清空影响)。
+
+注:Guest 模式的 guest_message 仅投递相册首帧(Telegram 平台限制),
+故 Guest 场景不支持多图相册,单图处理即可。
 """
 from __future__ import annotations
 

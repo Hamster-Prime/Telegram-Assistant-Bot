@@ -1,6 +1,7 @@
 """入站媒体解析 —— Telegram 媒体 → M3 多模态 content 块(plan §12)。"""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiogram.types import ExternalReplyInfo, Message, PhotoSize
@@ -18,6 +19,24 @@ log = get_logger("handlers.media")
 
 _DOC_EXTS = {"pdf", "docx", "txt"}
 _IMG_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
+_AUDIO_EXTS = {"mp3", "m4a", "wav"}
+
+
+@dataclass
+class ReferenceAssets:
+    """当前消息及被回复消息中提取的参考素材,供生成工具使用。
+
+    - images: 图片 data URL 列表(供图生图/图生视频/首尾帧/主体参考)
+    - audio:  音频原始字节(供音色复刻)
+    - audio_filename: 音频文件名
+    """
+    images: list[str] = field(default_factory=list)
+    audio: bytes | None = None
+    audio_filename: str = ""
+
+    @property
+    def has_any(self) -> bool:
+        return bool(self.images) or self.audio is not None
 
 
 async def _append_image(
@@ -137,3 +156,145 @@ async def build_content(
     if len(blocks) == 1 and blocks[0].get("type") == "text":
         return blocks[0]["text"], blocks[0]["text"]
     return blocks, text or "(多媒体消息)"
+
+
+async def _extract_image_refs(
+    svc: Services, message: Message | ExternalReplyInfo,
+    refs: ReferenceAssets, chat_id: int,
+) -> None:
+    """从单条消息提取图片参考(图片消息/图片文档)。追加到 refs.images。"""
+    photo = getattr(message, "photo", None)
+    document = getattr(message, "document", None)
+
+    if photo:
+        photo_size = photo[-1]
+        if (photo_size.file_size or 0) <= IMAGE_INLINE_LIMIT:
+            try:
+                data, _ = await download_file(svc.bot, photo_size.file_id)
+                url = await to_data_url(data, "image/jpeg")
+                refs.images.append(url)
+                log.info("参考图片已提取", 会话=chat_id, 来源="图片消息",
+                         大小KB=round(len(data) / 1024, 1))
+            except (ValueError, Exception) as e:
+                log.warning("参考图片提取失败", 会话=chat_id, 原因=str(e)[:160])
+
+    if document:
+        name = document.file_name or "file"
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if ext in _IMG_EXTS and (document.file_size or 0) <= IMAGE_INLINE_LIMIT:
+            try:
+                data, _ = await download_file(svc.bot, document.file_id)
+                url = await to_data_url(data, guess_mime(name, "image/png"))
+                refs.images.append(url)
+                log.info("参考图片已提取", 会话=chat_id, 来源="图片文档",
+                         文件名=name, 大小KB=round(len(data) / 1024, 1))
+            except (ValueError, Exception) as e:
+                log.warning("参考图片文档提取失败", 会话=chat_id, 原因=str(e)[:160])
+
+
+async def _extract_audio_ref(
+    svc: Services, message: Message | ExternalReplyInfo,
+    refs: ReferenceAssets, chat_id: int,
+) -> None:
+    """从单条消息提取音频参考(语音/音频消息/音频文档)。写入 refs.audio。"""
+    if refs.audio is not None:
+        return  # 仅保留第一个音频
+
+    voice = getattr(message, "voice", None)
+    audio = getattr(message, "audio", None)
+    document = getattr(message, "document", None)
+
+    target = None
+    filename = ""
+    if voice:
+        target = voice.file_id
+        filename = "voice.ogg"
+    elif audio:
+        target = audio.file_id
+        filename = audio.file_name or "audio.mp3"
+    elif document:
+        name = document.file_name or ""
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if ext in _AUDIO_EXTS:
+            target = document.file_id
+            filename = name
+
+    if target:
+        try:
+            data, _ = await download_file(svc.bot, target)
+            refs.audio = data
+            refs.audio_filename = filename
+            log.info("参考音频已提取", 会话=chat_id, 来源=filename,
+                     大小KB=round(len(data) / 1024, 1))
+        except (ValueError, Exception) as e:
+            log.warning("参考音频提取失败", 会话=chat_id, 原因=str(e)[:160])
+
+
+async def extract_references(
+    svc: Services, message: Message,
+) -> ReferenceAssets:
+    """从当前消息及被回复消息中提取参考素材(图片/音频)。
+
+    扫描范围:① 当前消息本身;② 被回复的消息(reply_to_message)。
+    用于:
+    - 图片参考 → 图生图 / 图生视频 / 首尾帧 / 主体参考
+    - 音频参考 → 音色复刻(回复一条语音/音频 + "/clone 音色名")
+    """
+    refs = ReferenceAssets()
+    chat_id = message.chat.id
+
+    # ① 当前消息
+    await _extract_image_refs(svc, message, refs, chat_id)
+    await _extract_audio_ref(svc, message, refs, chat_id)
+
+    # ② 被回复的消息
+    reply_msg = message.reply_to_message or getattr(message, "external_reply", None)
+    if reply_msg is not None:
+        await _extract_image_refs(svc, reply_msg, refs, chat_id)
+        await _extract_audio_ref(svc, reply_msg, refs, chat_id)
+
+    if refs.has_any:
+        log.info("参考素材汇总", 会话=chat_id,
+                 图片数=len(refs.images), 有音频=refs.audio is not None)
+    return refs
+
+
+async def build_group_content(
+    svc: Services, messages: list[Message],
+) -> tuple[Any, str, list[str]]:
+    """把相册(多条 Message)合并为多模态 content。
+
+    返回 (content, query_text, image_urls):
+    - content:多模态块列表(全部图片 + 合并 caption 文本)
+    - query_text:合并的纯文本(取所有 caption 拼接)
+    - image_urls:全部图片的 data URL(供参考素材用)
+
+    messages 应已按 message_id 排序(由 MediaGroupBuffer 保证)。
+    """
+    blocks: list[dict[str, Any]] = []
+    captions: list[str] = []
+    image_urls: list[str] = []
+    chat_id = messages[0].chat.id if messages else 0
+
+    for msg in messages:
+        if msg.caption:
+            captions.append(msg.caption)
+        if msg.photo:
+            photo_size = msg.photo[-1]
+            if (photo_size.file_size or 0) <= IMAGE_INLINE_LIMIT:
+                try:
+                    data, _ = await download_file(svc.bot, photo_size.file_id)
+                    url = await to_data_url(data, "image/jpeg")
+                    blocks.append({"type": "image_url", "image_url": {"url": url}})
+                    image_urls.append(url)
+                except (ValueError, Exception) as e:
+                    log.warning("相册图片处理失败", 会话=chat_id, 原因=str(e)[:160])
+
+    merged_text = "\n".join(captions)
+    if merged_text:
+        blocks.insert(0, {"type": "text", "text": merged_text})
+
+    query_text = merged_text or "(相册消息)"
+    log.info("相册内容已构建", 会话=chat_id, 图片数=len(image_urls),
+             有文本=bool(merged_text))
+    return blocks, query_text, image_urls

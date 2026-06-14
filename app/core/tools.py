@@ -19,7 +19,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "根据文字描述生成图片(同步,数秒内完成)",
+            "description": (
+                "根据文字描述生成图片(同步,数秒内完成)。"
+                "当用户消息中包含图片或回复了图片时,会自动进入图生图模式(以该图片人物为主体重新生成)。"
+                "可选画风预设(image-01-live 模型):漫画/元气/中世纪/水彩。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -28,6 +32,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                                      "description": "宽高比,默认 1:1"},
                     "n": {"type": "integer", "minimum": 1, "maximum": 9,
                           "description": "生成张数,默认 1"},
+                    "style_type": {"type": "string",
+                                   "enum": ["漫画", "元气", "中世纪", "水彩"],
+                                   "description": "画风预设(可选,使用 image-01-live 模型)"},
                 },
                 "required": ["prompt"],
             },
@@ -37,13 +44,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "generate_video",
-            "description": "根据文字描述生成视频(异步后台任务,需数分钟;调用后告知用户已开始,完成后另行发送)",
+            "description": (
+                "根据文字描述生成视频(异步后台任务,需数分钟)。"
+                "当用户消息含图片时自动进入图生视频模式:"
+                "1张图→图生视频(首帧);2张图→首尾帧生成;设为 subject_reference→主体参考(S2V)。"
+                "调用后告知用户已开始,完成后另行发送。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "视频内容描述"},
                     "duration": {"type": "integer", "enum": [6, 10], "description": "时长秒数,默认 6"},
                     "resolution": {"type": "string", "enum": ["768P", "1080P"], "description": "分辨率,默认 768P"},
+                    "reference_mode": {"type": "string",
+                                       "enum": ["first_frame", "subject_reference"],
+                                       "description": "图片参考模式(仅消息含图片时有效)。"
+                                                      "first_frame=首帧图生视频(默认),"
+                                                      "subject_reference=主体参考(保持人物面部)"},
                 },
                 "required": ["prompt"],
             },
@@ -53,7 +70,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "synthesize_speech",
-            "description": "把文本合成为语音并发送给用户(同步)",
+            "description": (
+                "把文本合成为语音并发送给用户(同步)。"
+                "可指定音色ID(系统音色或复刻/设计的自定义音色)、情绪、语言增强。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -62,6 +82,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "emotion": {"type": "string",
                                 "enum": ["happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"],
                                 "description": "情绪,可选"},
+                    "language_boost": {"type": "string",
+                                       "description": "语言增强,如 Chinese / English / Japanese / auto"},
                 },
                 "required": ["text"],
             },
@@ -80,6 +102,62 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "is_instrumental": {"type": "boolean", "description": "是否纯音乐,默认否"},
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clone_voice",
+            "description": (
+                "音色复刻:根据用户发送或回复的语音/音频文件,克隆该音色。"
+                "调用前用户必须回复一条语音/音频消息(或直接发送)。"
+                "复刻得到的音色7天内需正式用于语音合成才会永久保留。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "voice_id": {"type": "string",
+                                 "description": "自定义音色ID:首字符必须为字母,允许数字字母-_,"
+                                                "长度8-256,不可与已有ID重复"},
+                    "preview_text": {"type": "string",
+                                     "description": "试听文本(可选),提供后返回试听音频"},
+                },
+                "required": ["voice_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "design_voice",
+            "description": (
+                "音色设计:根据文字描述生成一个全新的个性化音色。"
+                "如'低沉磁性的男声播音员'。返回音色ID和试听音频。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "音色描述(如'温柔年轻女声、语速轻快')"},
+                    "preview_text": {"type": "string", "description": "试听文本,≤500字"},
+                    "voice_id": {"type": "string", "description": "自定义音色ID(可选,不传则自动生成)"},
+                },
+                "required": ["prompt", "preview_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_voices",
+            "description": "查询当前可用的音色ID列表(系统音色/复刻音色/设计音色)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "voice_type": {"type": "string",
+                                   "enum": ["system", "voice_cloning", "voice_generation", "all"],
+                                   "description": "音色类型,默认 all(全部)"},
+                },
             },
         },
     },
