@@ -325,7 +325,7 @@ async def render_whoami(
     uid: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     role_zh = {"superadmin": "超级管理员", "admin": "管理员", "user": "用户"}[user.role]
-    quota_html = await _quota_status_html(svc, user)
+    quota_html = await render_quota_status_html(svc, user)
     text = (
         f"<b>🪪 我的信息</b>\n\n"
         f"<b>ID</b>  <code>{user.tg_id}</code>\n"
@@ -344,27 +344,53 @@ async def render_quota_view(
     owner: int,
     uid: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    quota_html = await _quota_status_html(svc, user)
+    quota_html = await render_quota_status_html(svc, user)
     text = f"<b>📊 我的配额</b>\n\n{quota_html}"
     return text, info_kb("quota", scope=scope, owner=owner, uid=uid)
 
 
-# ── 配额状态 HTML 渲染(/quota /whoami 共用) ────────────────────
-async def _quota_status_html(svc: Services, user: User) -> str:
-    """渲染用户配额状态为 HTML 片段。"""
+# ── 配额状态 HTML 渲染(/quota /whoami /userinfo 共用) ────────────
+
+_PERIOD_CN: dict[str, str] = {"day": "每日", "month": "每月", "total": "总计"}
+
+
+def _fmt_count(n: int) -> str:
+    """数字格式化:<1万原样,>=1万用万表示。"""
+    if abs(n) >= 10_000:
+        return f"{n / 10_000:.1f}万".replace(".0万", "万")
+    return str(n)
+
+
+async def render_quota_status_html(svc: Services, user: User) -> str:
+    """渲染用户配额状态为 HTML 片段(含进度条,对齐 mmx-cli 风格)。
+
+    - 进度条按「剩余」百分比填充(剩余多则条满)
+    - 状态图标 🟢/🟡/🔴/♾️ 与 MiniMax 配额视图一致
+    - period 用中文(每日/每月/总计)
+    """
     quotas = await svc.daos.quotas.get_all(user.tg_id)
     if user.is_superadmin:
-        return "<b>配额</b>  无限(超级管理员)"
+        return "<b>配额</b>  ♾️ 无限(超级管理员)"
     if not quotas:
         return "<b>配额</b>  未设置(不限)"
     now_ts = int(time.time())
     lines = []
     for q in quotas:
         used = 0 if _window_expired(q, now_ts) else q.used
-        limit_txt = "无限" if q.unlimited else str(q.limit_val)
+        if q.unlimited:
+            lines.append(f"♾️ <b>{_esc(q.mode)}</b>  无限")
+            continue
+        remaining_pct = max(0.0, (q.limit_val - used) / q.limit_val * 100.0) if q.limit_val > 0 else 0.0
+        bar = _bar(remaining_pct)
+        icon = _status_icon(remaining_pct, 1)
+        period_cn = _PERIOD_CN.get(q.period, q.period)
+        reset_txt = _reset_at_text(q)
+        reset_short = reset_txt.split(" ", 1)[1] if " " in reset_txt else reset_txt
         lines.append(
-            f"· <b>{q.mode}</b>  {used}/{limit_txt} "
-            f"<i>({_esc(q.period)},重置于 {_esc(_reset_at_text(q))})</i>"
+            f"{icon} <b>{_esc(q.mode)}</b>  "
+            f"<code>{bar}</code> "
+            f"{_fmt_count(used)} / {_fmt_count(q.limit_val)} · "
+            f"{_esc(period_cn)} · {_esc(reset_short)} 重置"
         )
     return "<b>配额</b>\n" + "\n".join(lines)
 

@@ -49,6 +49,13 @@ INLINE_COMMANDS: list[tuple[str, str, str]] = [
     ("/start", "👋 开始使用", "查看介绍与帮助"),
 ]
 
+# 管理员追加命令(仅 admin+ 可见;需先回复目标用户消息)
+ADMIN_INLINE_COMMANDS: list[tuple[str, str, str]] = [
+    ("/grant", "✅ 授权此用户", "需先回复对方消息"),
+    ("/revoke", "🚫 取消授权", "需先回复对方消息"),
+    ("/userinfo", "📊 查看此人信息", "查看目标用户身份与配额(需先回复对方消息)"),
+]
+
 # cache_time 预设
 _CACHE_STATIC = 300   # 空查询(静态菜单):5 分钟
 _CACHE_QUERY = 60     # 文本/命令查询:1 分钟
@@ -82,11 +89,16 @@ async def handle_inline_query(
 
     mention = f"@{bot_username} " if bot_username else ""
 
+    # 管理员可见的追加命令列表
+    admin_cmds = ADMIN_INLINE_COMMANDS if user.is_admin else []
+
     if not raw:
         # 空查询:命令菜单 + 启动器引导
         results = _build_command_results(
             INLINE_COMMANDS, mention, bot_username,
         )
+        if admin_cmds:
+            results.extend(_build_command_results(admin_cmds, mention, bot_username))
         results.append(_article(
             _id="start",
             title="💬 向助理提问",
@@ -98,7 +110,7 @@ async def handle_inline_query(
 
     if raw.startswith("/"):
         # 命令前缀:过滤匹配的命令 + 启动器
-        matched = _filter_commands(raw)
+        matched = _filter_commands(raw, admin_cmds)
         results = _build_command_results(matched, mention, bot_username)
         results.append(_article(
             _id="q_" + secrets.token_hex(8),
@@ -123,14 +135,18 @@ async def handle_inline_query(
     log.info("Inline启动器应答", 用户=user.tg_id, 预览=raw[:60])
 
 
-def _filter_commands(prefix: str) -> list[tuple[str, str, str]]:
+def _filter_commands(
+    prefix: str, extra: list[tuple[str, str, str]] | None = None,
+) -> list[tuple[str, str, str]]:
     """按 / 前缀过滤命令(去掉前导 / 后做前缀匹配,大小写不敏感)。
 
     无匹配时返回全部命令(用户可能只是输入了 / 想看可用命令)。
+    extra 为管理员追加命令,合并到基础命令后一起过滤。
     """
+    pool = list(INLINE_COMMANDS) + (extra or [])
     q = prefix.lstrip("/").lower()
-    matched = [c for c in INLINE_COMMANDS if c[0].lstrip("/").startswith(q)]
-    return matched if matched else list(INLINE_COMMANDS)
+    matched = [c for c in pool if c[0].lstrip("/").startswith(q)]
+    return matched if matched else pool
 
 
 def _build_command_results(

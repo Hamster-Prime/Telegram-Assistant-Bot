@@ -370,8 +370,55 @@ async def test_render_quota_view_with_quotas():
     svc = _fake_svc(quota_all=[q])
     user = _make_user(1)
     text, kb = await render_quota_view(svc, user, scope="user", owner=1, uid=1)
-    assert "30/100" in text
+    assert "30 / 100" in text
+    assert "每日" in text  # period 中文标签
     assert kb is not None
+
+
+async def test_render_quota_status_html_progress_bar():
+    """配额 HTML 含进度条 + 状态图标 + 中文 period 标签。"""
+    from app.handlers.lists import render_quota_status_html
+    q = _make_quota(1, "tokens", "day", 100, 50)
+    svc = _fake_svc(quota_all=[q])
+    user = _make_user(1)
+    html = await render_quota_status_html(svc, user)
+    assert "█" in html       # 进度条
+    assert "🟢" in html      # 50% used = 50% remaining → 🟢
+    assert "每日" in html     # period 中文
+    assert "50 / 100" in html
+    assert "<b>tokens</b>" in html
+
+
+async def test_render_quota_status_html_low_remaining():
+    """剩余 <20% 时显示红色图标。"""
+    from app.handlers.lists import render_quota_status_html
+    q = _make_quota(1, "tokens", "day", 100, 90)  # 90 used, 10% remaining
+    svc = _fake_svc(quota_all=[q])
+    user = _make_user(1)
+    html = await render_quota_status_html(svc, user)
+    assert "🔴" in html
+    assert "90 / 100" in html
+
+
+async def test_render_quota_status_html_unlimited():
+    """limit=-1 不限时显示 ♾️。"""
+    from app.handlers.lists import render_quota_status_html
+    q = _make_quota(1, "tokens", "total", -1, 0)
+    svc = _fake_svc(quota_all=[q])
+    user = _make_user(1)
+    html = await render_quota_status_html(svc, user)
+    assert "♾️" in html
+    assert "无限" in html
+
+
+async def test_render_quota_status_html_large_numbers():
+    """大数字格式化(万)。"""
+    from app.handlers.lists import render_quota_status_html
+    q = _make_quota(1, "tokens", "day", 200_000, 50_000)
+    svc = _fake_svc(quota_all=[q])
+    user = _make_user(1)
+    html = await render_quota_status_html(svc, user)
+    assert "5万 / 20万" in html
 
 
 # ── CallbackData 往返 ──────────────────────────────────────────

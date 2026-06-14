@@ -42,12 +42,17 @@ async def answer_guest_text(bot: Bot, guest_query_id: str, text: str) -> None:
     """经 answerGuestQuery 把命令应答作为 inline 消息发出(Guest 唯一应答通道)。
 
     统一以 HTML 解析模式发送(logic_* 返回的为 HTML 文本)。
+    标题取首行纯文本(剥离 HTML 标签),让 inline 卡片标题有意义。
     """
+    import re
+
+    first_line = text.lstrip().split("\n", 1)[0].strip()
+    title = re.sub(r"<[^>]+>", "", first_line).strip()[:64] or "命令响应"
     await bot(AnswerGuestQuery(
         guest_query_id=str(guest_query_id),
         result=InlineQueryResultArticle(
             id=str(guest_query_id)[:60] or "cmd",
-            title="命令响应",
+            title=title,
             input_message_content=InputTextMessageContent(
                 message_text=text, parse_mode="HTML"),
         ),
@@ -70,10 +75,58 @@ async def execute_guest_command(
     if not cmd:
         return None
 
-    # 管理类命令在 Guest 场景不可用:明确告知而非静默落入 AI 流程
+    # 管理员命令在 Guest 场景下可用:授权/撤销/配额/查看用户
+    # (需先回复目标用户的消息,或传用户 ID 作参数)
+    _ADMIN_ACTION_CMDS = {"grant", "revoke", "setquota", "resetquota", "userinfo"}
+    if cmd in _ADMIN_ACTION_CMDS:
+        from app.core.auth import require_role
+        from app.handlers.admin_actions import (
+            extract_target_info,
+            logic_grant,
+            logic_resetquota,
+            logic_revoke,
+            logic_setquota,
+            logic_userinfo,
+        )
+        if not require_role(user, "admin"):
+            return "⛔ 需要管理员权限"
+        info = extract_target_info(message, args)
+        if info is None:
+            return ("ℹ️ 请先回复目标用户的消息,或提供用户 ID\n"
+                    "例如:回复对方消息后发送 @bot /grant")
+        target = info.tg_id
+        if cmd == "grant":
+            return await logic_grant(
+                svc, user, target, username=info.username, first_name=info.first_name)
+        if cmd == "revoke":
+            return await logic_revoke(
+                svc, user, target, username=info.username, first_name=info.first_name)
+        if cmd == "userinfo":
+            return await logic_userinfo(svc, user, target)
+        if cmd == "setquota":
+            # 回复模式下首个参数是 mode;否则首个是 target(已被 extract_target_info 消费)
+            rest = args.split()
+            # 若首个参数是数字(target),跳过它取后续参数
+            if rest and rest[0].isdigit():
+                rest = rest[1:]
+            if len(rest) < 2 or rest[0] not in ("calls", "tokens"):
+                return "用法:/setquota <calls|tokens> <上限> [day|month|total]\n-1 = 无限"
+            try:
+                limit = int(rest[1])
+            except ValueError:
+                return "参数错误:上限必须是数字"
+            period = rest[2] if len(rest) > 2 and rest[2] in ("day", "month", "total") else "day"
+            return await logic_setquota(svc, user, target, rest[0], limit, period)
+        if cmd == "resetquota":
+            rest = args.split()
+            if rest and rest[0].isdigit():
+                rest = rest[1:]
+            mode = rest[0] if rest and rest[0] in ("calls", "tokens") else None
+            return await logic_resetquota(svc, user, target, mode)
+
+    # 其余管理类命令(分页/敏感信息)在 Guest 场景不可用
     _ADMIN_CMDS = {
-        "grant", "revoke", "setquota", "resetquota", "quotas",
-        "users", "stats", "promote", "demote", "broadcast", "audit",
+        "quotas", "users", "stats", "promote", "demote", "broadcast", "audit",
     }
     if cmd in _ADMIN_CMDS:
         return "ℹ️ 该管理命令请直接在与我的私聊中使用。"

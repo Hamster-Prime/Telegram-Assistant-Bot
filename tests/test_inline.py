@@ -18,7 +18,7 @@ import pytest
 from app.db.dao import DAOBundle
 from app.db.engine import Database
 from app.db.models import User
-from app.handlers.inline import INLINE_COMMANDS, handle_inline_query
+from app.handlers.inline import ADMIN_INLINE_COMMANDS, INLINE_COMMANDS, handle_inline_query
 
 
 def _make_user(uid: int, allowed: bool, role: str = "user") -> User:
@@ -186,3 +186,60 @@ def test_inline_commands_count():
     """快捷菜单命令数量 = 5(/help /whoami /quota /reset /start)。"""
     cmds = [c[0] for c in INLINE_COMMANDS]
     assert cmds == ["/help", "/whoami", "/quota", "/reset", "/start"]
+
+
+# ── 管理员追加命令 ─────────────────────────────────────────────
+async def test_admin_empty_query_shows_admin_commands(svc):
+    """管理员空查询看到基础命令 + 管理命令 + 启动器。"""
+    iq = FakeInlineQuery("")
+    admin = _make_user(10, True, role="admin")
+    await handle_inline_query(iq, admin, svc)
+    args, _ = iq.answer.call_args
+    results = args[0]
+    # 基础(5) + 管理(3) + 启动器(1)
+    assert len(results) == len(INLINE_COMMANDS) + len(ADMIN_INLINE_COMMANDS) + 1
+    titles = [r.title for r in results]
+    assert any("授权此用户" in t for t in titles)
+    assert any("取消授权" in t for t in titles)
+    assert any("查看此人信息" in t for t in titles)
+
+
+async def test_regular_user_empty_query_no_admin_commands(svc):
+    """普通用户看不到管理命令。"""
+    iq = FakeInlineQuery("")
+    await handle_inline_query(iq, _make_user(11, True), svc)
+    args, _ = iq.answer.call_args
+    titles = [r.title for r in args[0]]
+    assert not any("授权此用户" in t for t in titles)
+    assert not any("取消授权" in t for t in titles)
+
+
+async def test_admin_slash_grant_filters_admin_commands(svc):
+    """管理员输入 /g → 命中 /grant(管理命令)。"""
+    iq = FakeInlineQuery("/g")
+    admin = _make_user(12, True, role="admin")
+    await handle_inline_query(iq, admin, svc)
+    args, _ = iq.answer.call_args
+    cmd_results = [r for r in args[0] if r.id.startswith("cmd")]
+    assert any("授权此用户" in r.title for r in cmd_results)
+
+
+async def test_admin_command_message_text_has_mention(svc):
+    """管理命令文章 message_text 形如 '@bot /grant'。"""
+    iq = FakeInlineQuery("")
+    admin = _make_user(13, True, role="admin")
+    await handle_inline_query(iq, admin, svc)
+    args, _ = iq.answer.call_args
+    grant_results = [r for r in args[0] if "授权此用户" in r.title]
+    assert len(grant_results) == 1
+    assert grant_results[0].input_message_content.message_text == "@testbot /grant"
+
+
+async def test_superadmin_sees_admin_commands(svc):
+    """超级管理员也能看到管理命令。"""
+    iq = FakeInlineQuery("")
+    su = _make_user(14, True, role="superadmin")
+    await handle_inline_query(iq, su, svc)
+    args, _ = iq.answer.call_args
+    titles = [r.title for r in args[0]]
+    assert any("授权此用户" in t for t in titles)

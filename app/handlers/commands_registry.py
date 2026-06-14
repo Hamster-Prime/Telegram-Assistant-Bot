@@ -55,6 +55,7 @@ USER_COMMANDS: list[CmdSpec] = [
 ADMIN_COMMANDS: list[CmdSpec] = [
     CmdSpec("grant", "授权用户"),
     CmdSpec("revoke", "撤销授权"),
+    CmdSpec("userinfo", "查看用户信息(身份/配额)"),
     CmdSpec("setquota", "设置用户配额"),
     CmdSpec("resetquota", "清零用户配额"),
     CmdSpec("quotas", "配额列表"),

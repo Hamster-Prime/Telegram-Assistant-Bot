@@ -24,13 +24,18 @@ class UserDAO:
         return User(**dict(row)) if row else None
 
     async def upsert_basic(self, tg_id: int, username: str | None, first_name: str | None) -> User:
-        """更新用户名等基础信息;不存在则创建(默认未授权)。"""
+        """更新用户名等基础信息;不存在则创建(默认未授权)。
+
+        COALESCE 保护:传入 None 时不覆盖已有值(grant 时仅知 ID 不会清空已知名)。
+        """
         now = _now()
         await self.db.execute(
             """INSERT INTO users (tg_id, username, first_name, created_at, updated_at)
                VALUES (?,?,?,?,?)
                ON CONFLICT(tg_id) DO UPDATE SET
-                 username=excluded.username, first_name=excluded.first_name, updated_at=excluded.updated_at""",
+                 username=COALESCE(excluded.username, users.username),
+                 first_name=COALESCE(excluded.first_name, users.first_name),
+                 updated_at=excluded.updated_at""",
             (tg_id, username, first_name, now, now),
         )
         user = await self.get(tg_id)

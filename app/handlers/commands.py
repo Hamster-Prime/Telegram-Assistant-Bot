@@ -17,6 +17,14 @@ from aiogram.types import Message
 from app.core.auth import require_role
 from app.core.htmlfmt import sanitize_telegram_html
 from app.db.models import User
+from app.handlers.admin_actions import (
+    extract_target_info,
+    logic_grant,
+    logic_resetquota,
+    logic_revoke,
+    logic_setquota,
+    logic_userinfo,
+)
 from app.handlers.lists import (
     mmx_quota_kb,
     mmx_quota_result_kb,
@@ -38,10 +46,19 @@ log = get_logger("handlers.commands")
 router = Router(name="commands")
 
 
+def _reply_target_id(message: Message) -> int | None:
+    """仅从回复目标提取用户 ID(不含参数回退);供 setquota/resetquota 区分回复模式。"""
+    reply = getattr(message, "reply_to_message", None) or getattr(message, "external_reply", None)
+    if reply and getattr(reply, "from_user", None):
+        return reply.from_user.id
+    return None
+
+
 def _parse_target_id(message: Message, command: CommandObject) -> int | None:
     """从「回复目标」或「命令参数」解析目标用户 ID。"""
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
+    rid = _reply_target_id(message)
+    if rid is not None:
+        return rid
     if command.args:
         first = command.args.split()[0]
         try:
@@ -181,21 +198,14 @@ async def cmd_grant(message: Message, command: CommandObject, user: User, svc: S
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
-    target = _parse_target_id(message, command)
-    if target is None:
+    info = extract_target_info(message, command.args or "")
+    if info is None:
         await message.answer("用法:/grant <用户ID>(或回复目标用户的消息)")
         return
-    await svc.daos.users.upsert_basic(target, None, None)
-    await svc.daos.users.set_authorized(target, True, by=user.tg_id)
-    await svc.quota.ensure_default(target)
-    await svc.daos.audit.add(user.tg_id, "grant", target, "授权用户")
-    # 刷新该用户私聊命令菜单(若已是 admin/superadmin 则反映对应级别)
-    target_user = await svc.daos.users.get(target)
-    if target_user is not None and target_user.role in ("admin", "superadmin"):
-        from app.handlers.commands_registry import refresh_user_commands
-
-        await refresh_user_commands(svc.bot, target, target_user.role)
-    await message.answer(f"✅ 已授权用户 {target}(套用默认配额)")
+    await message.answer(
+        await logic_grant(svc, user, info.tg_id, username=info.username, first_name=info.first_name),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("revoke"))
@@ -203,20 +213,14 @@ async def cmd_revoke(message: Message, command: CommandObject, user: User, svc: 
     if not require_role(user, "admin"):
         await message.answer("⛔ 需要管理员权限")
         return
-    target = _parse_target_id(message, command)
-    if target is None:
-        await message.answer("用法:/revoke <用户ID>")
+    info = extract_target_info(message, command.args or "")
+    if info is None:
+        await message.answer("用法:/revoke <用户ID>(或回复目标用户的消息)")
         return
-    if target in svc.settings.superadmin_id_list:
-        await message.answer("⛔ 不能撤销超级管理员")
-        return
-    await svc.daos.users.set_authorized(target, False, by=user.tg_id)
-    await svc.daos.audit.add(user.tg_id, "revoke", target, "撤销授权")
-    # 撤权后该用户降为普通菜单(若曾有 admin 命令,现在不再显示)
-    from app.handlers.commands_registry import refresh_user_commands
-
-    await refresh_user_commands(svc.bot, target, "user")
-    await message.answer(f"🚫 已撤销用户 {target} 的授权")
+    await message.answer(
+        await logic_revoke(svc, user, info.tg_id, username=info.username, first_name=info.first_name),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("setquota"))
@@ -228,17 +232,28 @@ async def cmd_setquota(message: Message, command: CommandObject, user: User, svc
     if len(parts) < 3 or parts[1] not in ("calls", "tokens"):
         await message.answer(
             "用法:/setquota <用户ID> <calls|tokens> <上限> [day|month|total]\n-1 = 无限"
+            "\n(或回复目标用户消息:/setquota <calls|tokens> <上限> [period])"
         )
         return
+    # 回复模式:首个参数是 mode 而非用户ID
+    reply_target = _reply_target_id(message)
+    if reply_target is not None:
+        mode, limit_str = parts[0], parts[1]
+        target = reply_target
+        period = parts[2] if len(parts) > 2 and parts[2] in ("day", "month", "total") else "day"
+    else:
+        try:
+            target, mode, limit_str = int(parts[0]), parts[1], parts[2]
+        except ValueError:
+            await message.answer("参数错误:用户ID 与上限必须是数字")
+            return
+        period = parts[3] if len(parts) > 3 and parts[3] in ("day", "month", "total") else "day"
     try:
-        target, mode, limit = int(parts[0]), parts[1], int(parts[2])
+        limit = int(limit_str)
     except ValueError:
-        await message.answer("参数错误:用户ID 与上限必须是数字")
+        await message.answer("参数错误:上限必须是数字")
         return
-    period = parts[3] if len(parts) > 3 and parts[3] in ("day", "month", "total") else "day"
-    await svc.daos.quotas.set(target, mode, limit, period)
-    await svc.daos.audit.add(user.tg_id, "setquota", target, f"{mode}={limit}/{period}")
-    await message.answer(f"📊 已设置用户 {target} 配额:{mode} {limit}({period})")
+    await message.answer(await logic_setquota(svc, user, target, mode, limit, period), parse_mode="HTML")
 
 
 @router.message(Command("resetquota"))
@@ -249,18 +264,34 @@ async def cmd_resetquota(
         await message.answer("⛔ 需要管理员权限")
         return
     parts = (command.args or "").split()
-    if not parts:
-        await message.answer("用法:/resetquota <用户ID> [calls|tokens]")
+    reply_target = _reply_target_id(message)
+    if reply_target is not None:
+        # 回复模式:/resetquota [calls|tokens]
+        target = reply_target
+        mode = parts[0] if parts and parts[0] in ("calls", "tokens") else None
+    elif not parts:
+        await message.answer("用法:/resetquota <用户ID> [calls|tokens]\n(或回复目标用户消息)")
         return
-    try:
-        target = int(parts[0])
-    except ValueError:
-        await message.answer("用户ID 必须是数字")
+    else:
+        try:
+            target = int(parts[0])
+        except ValueError:
+            await message.answer("用户ID 必须是数字")
+            return
+        mode = parts[1] if len(parts) > 1 and parts[1] in ("calls", "tokens") else None
+    await message.answer(await logic_resetquota(svc, user, target, mode), parse_mode="HTML")
+
+
+@router.message(Command("userinfo"))
+async def cmd_userinfo(message: Message, command: CommandObject, user: User, svc: Services) -> None:
+    if not require_role(user, "admin"):
+        await message.answer("⛔ 需要管理员权限")
         return
-    mode = parts[1] if len(parts) > 1 and parts[1] in ("calls", "tokens") else None
-    await svc.daos.quotas.reset_used(target, mode)
-    await svc.daos.audit.add(user.tg_id, "resetquota", target, mode or "all")
-    await message.answer(f"🔄 已清零用户 {target} 的{mode or '全部'}配额用量")
+    target = _parse_target_id(message, command)
+    if target is None:
+        await message.answer("用法:/userinfo <用户ID>(或回复目标用户的消息)")
+        return
+    await message.answer(await logic_userinfo(svc, user, target), parse_mode="HTML")
 
 
 def _require_private(message: Message) -> bool:
