@@ -12,7 +12,7 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from aiogram import Bot
-from aiogram.methods import EditMessageMedia
+from aiogram.methods import EditMessageMedia, SendRichMessage
 from aiogram.types import (
     BufferedInputFile,
     InputMediaAudio,
@@ -21,10 +21,12 @@ from aiogram.types import (
 
 from app.core.concurrency import ConcurrencyGuard, SendRateLimiter, TaskRegistry
 from app.core.htmlfmt import sanitize_telegram_html
+from app.core.richmsg import RichAttachment, to_rich_input
 from app.db.dao import DAOBundle
 from app.db.models import Generation, User
 from app.logging import get_logger
 from app.minimax.client import MiniMaxError
+from app.utils.tokens import estimate_tokens
 
 if TYPE_CHECKING:
     from app.core.quota import QuotaManager
@@ -198,7 +200,11 @@ class GenWorkerPool:
             url = await self._files.retrieve_url(file_id)
             caption = f"🎬 视频已生成:{gen.prompt[:100]}"
             html_caption = sanitize_telegram_html(caption)
-            if gen.inline_message_id:
+            rich_text = f"{caption}\n\n{RichAttachment('video', url, '生成视频').markdown}"
+            rich_ok = await self._deliver_rich_result(gen, rich_text)
+            if rich_ok:
+                data_len = 0
+            elif gen.inline_message_id:
                 # Guest:inline editMessageMedia(URL),失败降级为文本+链接
                 media = InputMediaVideo(media=url, caption=html_caption,
                                         parse_mode="HTML")
@@ -220,7 +226,13 @@ class GenWorkerPool:
             await self._daos.generations.update_status(
                 gen_id, "success", file_id=file_id, result_url=url, finished=True
             )
-            await self._edit_placeholder(gen, "✅ 视频已生成完毕,见下方")
+            await self._record_generation_result(
+                gen,
+                f"视频生成完成:{gen.prompt[:100]}\n结果URL:{url}\n"
+                "说明:这是 Bot 生成结果,不是用户上传素材。",
+            )
+            if not rich_ok:
+                await self._edit_placeholder(gen, "✅ 视频已生成完毕,见下方")
             user = await self._daos.users.get(gen.user_id)
             if user:
                 await self._quota.settle(user, "calls", self._quota.call_weight("video"),
@@ -280,7 +292,13 @@ class GenWorkerPool:
                 return
             caption = f"🎵 音乐已生成:{prompt[:100]}"
             html_caption = sanitize_telegram_html(caption)
-            if gen.inline_message_id:
+            rich_ok = False
+            if audio_url:
+                rich_text = f"{caption}\n\n{RichAttachment('audio', audio_url, '生成音乐').markdown}"
+                rich_ok = await self._deliver_rich_result(gen, rich_text)
+            if rich_ok:
+                pass
+            elif gen.inline_message_id:
                 # Guest:inline editMessageMedia(URL),失败降级为文本+链接
                 url = audio_url
                 if not url:
@@ -312,7 +330,8 @@ class GenWorkerPool:
                     raise RuntimeError("MiniMax 未返回音频数据")
             await self._daos.generations.update_status(gen_id, "success",
                                                        result_url=audio_url, finished=True)
-            await self._edit_placeholder(gen, "✅ 音乐已生成完毕,见下方")
+            if not rich_ok:
+                await self._edit_placeholder(gen, "✅ 音乐已生成完毕,见下方")
             await self._quota.settle(user, "calls", self._quota.call_weight("music"),
                                      chat_id=gen.chat_id, kind="music")
             log.info("音乐任务完成", 生成编号=gen_id)
@@ -333,6 +352,46 @@ class GenWorkerPool:
             )
         except Exception as e:
             log.debug("占位消息编辑失败(忽略)", 生成编号=gen.id, 错误=str(e)[:120])
+
+    async def _deliver_rich_result(self, gen: Generation, markdown: str) -> bool:
+        """优先用 Rich Message 承载生成结果;失败时由调用方走媒体兜底。"""
+        try:
+            await self._limiter.acquire()
+            if gen.inline_message_id:
+                await self._bot.edit_message_text(
+                    rich_message=to_rich_input(markdown),
+                    inline_message_id=gen.inline_message_id,
+                )
+            elif gen.placeholder_msg_id:
+                await self._bot.edit_message_text(
+                    rich_message=to_rich_input(markdown),
+                    chat_id=gen.chat_id,
+                    message_id=gen.placeholder_msg_id,
+                )
+            else:
+                await self._bot(SendRichMessage(
+                    chat_id=gen.chat_id,
+                    rich_message=to_rich_input(markdown),
+                ))
+            return True
+        except Exception as e:
+            if "message is not modified" in str(e):
+                log.info("Rich Message 生成结果已存在,按投递成功处理",
+                         生成编号=gen.id, 类型=gen.kind)
+                return True
+            log.warning("Rich Message 生成结果投递失败(将走媒体兜底)", 生成编号=gen.id,
+                        类型=gen.kind, 错误=str(e)[:160])
+            return False
+
+    async def _record_generation_result(self, gen: Generation, text: str) -> None:
+        try:
+            await self._daos.messages.add(
+                gen.chat_id, None, "assistant", text,
+                tokens=estimate_tokens(text),
+            )
+        except Exception as e:
+            log.debug("生成结果状态写入历史失败(忽略)", 生成编号=gen.id,
+                      错误=str(e)[:120])
 
     async def _edit_inline_media(self, inline_message_id: str, media: Any) -> bool:
         """Guest:把 inline 消息转成媒体(editMessageMedia,仅 URL)。成功 True。"""

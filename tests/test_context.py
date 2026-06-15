@@ -63,6 +63,17 @@ async def test_system_prompt_forbids_faked_generation(daos: DAOBundle):
     assert "generate_image" in system
 
 
+async def test_system_prompt_restricts_media_references_to_current_turn(daos: DAOBundle):
+    cb = ContextBuilder(daos)
+    msgs = await cb.build(100, 1, "生成视频", query_text="生成视频")
+    system = msgs[0]["content"]
+
+    assert "只有本轮用户消息" in system
+    assert "历史消息" in system
+    assert "助理生成的语音" in system
+    assert "不能当作本轮用户发送" in system
+
+
 async def test_system_prompt_requires_aggressive_search(daos: DAOBundle):
     """激进搜索:训练知识有截止日期,现实世界实体问题一律先搜。"""
     cb = ContextBuilder(daos)

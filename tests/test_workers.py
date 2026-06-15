@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 
@@ -19,17 +20,27 @@ class FakeBot:
         self.videos: list = []
         self.audios: list = []
         self.messages: list = []
+        self.rich_messages: list = []
         self.edits: list = []
+        self.rich_edits: list = []
         self.inline_media_calls: list = []  # EditMessageMedia(inline) 调用
         self.inline_text_edits: list = []
+        self.inline_rich_edits: list = []
+        self.rich_error: Exception | None = None
 
     async def __call__(self, method):
         # Guest inline 回填路径:bot(EditMessageMedia(inline_message_id=...))
-        from aiogram.methods import EditMessageMedia
+        from aiogram.methods import EditMessageMedia, SendRichMessage
         if isinstance(method, EditMessageMedia):
             self.inline_media_calls.append(method)
             from types import SimpleNamespace
             return SimpleNamespace(ok=True)
+        if isinstance(method, SendRichMessage):
+            if self.rich_error is not None:
+                raise self.rich_error
+            self.rich_messages.append((method.chat_id, method.rich_message.markdown))
+            from types import SimpleNamespace
+            return SimpleNamespace(message_id=777)
         return None
 
     async def send_video(self, chat_id, video, caption=None, **kw):
@@ -45,12 +56,21 @@ class FakeBot:
             message_id = 555
         return M()
 
-    async def edit_message_text(self, text, chat_id=None, message_id=None,
-                                inline_message_id=None, **kw):
+    async def edit_message_text(self, text=None, chat_id=None, message_id=None,
+                                inline_message_id=None, rich_message=None, **kw):
+        recorded = text if text is not None else rich_message.markdown
+        if rich_message is not None and self.rich_error is not None:
+            raise self.rich_error
         if inline_message_id:
-            self.inline_text_edits.append((inline_message_id, text))
+            if rich_message is not None:
+                self.inline_rich_edits.append((inline_message_id, recorded))
+            else:
+                self.inline_text_edits.append((inline_message_id, recorded))
         else:
-            self.edits.append((chat_id, message_id, text))
+            if rich_message is not None:
+                self.rich_edits.append((chat_id, message_id, recorded))
+            else:
+                self.edits.append((chat_id, message_id, recorded))
 
 
 class FakeVideoAPI:
@@ -112,20 +132,33 @@ async def env():
     await db.close()
 
 
+async def _wait_generation(daos: DAOBundle, gen_id: int, *, attempts: int = 200):
+    last = None
+    for _ in range(attempts):
+        try:
+            last = await daos.generations.get(gen_id)
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e):
+                raise
+            await asyncio.sleep(0.02)
+            continue
+        if last and last.status in {"success", "failed"}:
+            return last
+        await asyncio.sleep(0.02)
+    return last
+
+
 async def test_video_submit_and_poll_success(env):
     pool, daos, bot, user, registry = env
     gen_id, task_id = await pool.submit_video(user, 100, "雪山日落",
                                               placeholder_msg_id=55)
     assert task_id == "task-1"
     # 等后台轮询完成(0.01s 起步)
-    for _ in range(200):
-        gen = await daos.generations.get(gen_id)
-        if gen.status == "success":
-            break
-        await asyncio.sleep(0.02)
+    gen = await _wait_generation(daos, gen_id)
     assert gen.status == "success"
-    assert bot.videos and bot.videos[0][0] == 100
-    assert any("✅" in e[2] for e in bot.edits)  # 占位被改为完成
+    assert bot.videos == []
+    assert bot.rich_edits and bot.rich_edits[0][0:2] == (100, 55)
+    assert "https://cdn.test/file-1" in bot.rich_edits[0][2]
 
 
 async def test_finalize_idempotent(env):
@@ -140,31 +173,36 @@ async def test_finalize_idempotent(env):
     )
     # 再补一次也不重复
     await pool.finalize_video(gen_id, "file-9", source="轮询")
-    assert len(bot.videos) == 1
+    assert len(bot.rich_messages) == 1
+    assert bot.videos == []
 
 
 async def test_music_background(env):
     pool, daos, bot, user, _ = env
     gen_id = await pool.submit_music(user, 200, "欢快的钢琴曲",
                                      is_instrumental=True, placeholder_msg_id=66)
-    for _ in range(100):
-        gen = await daos.generations.get(gen_id)
-        if gen.status == "success":
-            break
-        await asyncio.sleep(0.02)
+    gen = await _wait_generation(daos, gen_id, attempts=100)
     assert gen.status == "success"
     assert bot.audios and bot.audios[0][0] == 200
+
+
+async def test_music_url_edits_placeholder_as_rich_message(env):
+    pool, daos, bot, user, _ = env
+    pool._music.url_mode = True
+    gen_id = await pool.submit_music(user, 200, "欢快的钢琴曲",
+                                     is_instrumental=True, placeholder_msg_id=66)
+    gen = await _wait_generation(daos, gen_id, attempts=100)
+    assert gen.status == "success"
+    assert bot.audios == []
+    assert bot.rich_edits and bot.rich_edits[0][0:2] == (200, 66)
+    assert "https://cdn.test/music.mp3" in bot.rich_edits[0][2]
 
 
 async def test_video_failed_marks_and_notifies(env):
     pool, daos, bot, user, _ = env
     pool._video.status_seq = [("failed", None)]
     gen_id, _ = await pool.submit_video(user, 100, "x", placeholder_msg_id=77)
-    for _ in range(100):
-        gen = await daos.generations.get(gen_id)
-        if gen.status == "failed":
-            break
-        await asyncio.sleep(0.02)
+    gen = await _wait_generation(daos, gen_id, attempts=100)
     assert gen.status == "failed"
     assert any("失败" in e[2] for e in bot.edits)
 
@@ -180,13 +218,63 @@ async def test_recover_pending_restarts_polling(env):
 
     n = await pool.recover_pending()
     assert n == 1
-    for _ in range(100):
-        g = await daos.generations.get(gen_id)
-        if g.status == "success":
-            break
-        await asyncio.sleep(0.02)
+    g = await _wait_generation(daos, gen_id, attempts=100)
     assert g.status == "success"
+    assert bot.videos == []
+    assert len(bot.rich_messages) == 1
+
+
+async def test_video_rich_message_failure_falls_back_to_media(env):
+    pool, daos, bot, user, _ = env
+    bot.rich_error = RuntimeError("rich rejected")
+    gen = Generation(id=None, user_id=1, chat_id=100, kind="video",
+                     model="m", prompt="p", status="processing", task_id="t-x")
+    gen_id = await daos.generations.create(gen)
+
+    await pool.finalize_video(gen_id, "file-9", source="回调")
+
+    assert bot.rich_messages == []
     assert len(bot.videos) == 1
+
+
+async def test_video_rich_message_not_modified_is_treated_as_delivered(env):
+    pool, daos, bot, user, _ = env
+    bot.rich_error = RuntimeError(
+        "Telegram server says - Bad Request: message is not modified: "
+        "specified new message content and reply markup are exactly the same "
+        "as a current content and reply"
+    )
+    gen = Generation(id=None, user_id=1, chat_id=100, kind="video",
+                     model="m", prompt="p", status="processing", task_id="t-x",
+                     placeholder_msg_id=55)
+    gen_id = await daos.generations.create(gen)
+
+    await pool.finalize_video(gen_id, "file-9", source="回调")
+
+    updated = await daos.generations.get(gen_id)
+    assert updated.status == "success"
+    assert updated.result_url == "https://cdn.test/file-9"
+    assert bot.videos == []
+    assert bot.edits == []
+
+
+async def test_video_completion_records_assistant_status_for_future_context(env):
+    pool, daos, bot, user, _ = env
+    gen = Generation(id=None, user_id=1, chat_id=100, kind="video",
+                     model="m", prompt="p", status="processing", task_id="t-x",
+                     placeholder_msg_id=55)
+    gen_id = await daos.generations.create(gen)
+
+    await pool.finalize_video(gen_id, "file-9", source="回调")
+
+    recent = await daos.messages.recent_uncompacted(100)
+    assert any(
+        m.role == "assistant"
+        and "视频生成完成" in m.content
+        and "https://cdn.test/file-9" in m.content
+        and "不是用户上传素材" in m.content
+        for m in recent
+    )
 
 
 async def test_recover_music_fails_gracefully(env):
@@ -209,18 +297,14 @@ async def test_video_guest_inline_backfill(env):
         user, 100, "海浪", placeholder_msg_id=None,
         inline_message_id="guest-inline-1")
     # 等后台轮询完成
-    for _ in range(200):
-        gen = await daos.generations.get(gen_id)
-        if gen.status == "success":
-            break
-        await asyncio.sleep(0.02)
+    gen = await _wait_generation(daos, gen_id)
     assert gen.status == "success"
     assert gen.inline_message_id == "guest-inline-1"
     assert bot.videos == []  # 不走直发
-    assert len(bot.inline_media_calls) == 1
-    from aiogram.types import InputMediaVideo
-    assert isinstance(bot.inline_media_calls[0].media, InputMediaVideo)
-    assert bot.inline_media_calls[0].inline_message_id == "guest-inline-1"
+    assert bot.inline_media_calls == []
+    assert len(bot.inline_rich_edits) == 1
+    assert bot.inline_rich_edits[0][0] == "guest-inline-1"
+    assert "https://cdn.test/file-1" in bot.inline_rich_edits[0][1]
 
 
 async def test_music_guest_inline_backfill(env):
@@ -230,13 +314,10 @@ async def test_music_guest_inline_backfill(env):
     gen_id = await pool.submit_music(
         user, 200, "钢琴曲", is_instrumental=True,
         inline_message_id="guest-inline-2")
-    for _ in range(100):
-        gen = await daos.generations.get(gen_id)
-        if gen.status == "success":
-            break
-        await asyncio.sleep(0.02)
+    gen = await _wait_generation(daos, gen_id, attempts=100)
     assert gen.status == "success"
     assert bot.audios == []  # 不走直发
-    assert len(bot.inline_media_calls) == 1
-    from aiogram.types import InputMediaAudio
-    assert isinstance(bot.inline_media_calls[0].media, InputMediaAudio)
+    assert bot.inline_media_calls == []
+    assert len(bot.inline_rich_edits) == 1
+    assert bot.inline_rich_edits[0][0] == "guest-inline-2"
+    assert "https://cdn.test/music.mp3" in bot.inline_rich_edits[0][1]

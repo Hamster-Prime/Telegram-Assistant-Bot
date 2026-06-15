@@ -8,6 +8,7 @@ from typing import Any
 from aiogram.types import Message
 
 from app.core.delivery import DirectDelivery, GuestDelivery, MediaDelivery
+from app.core.richmsg import RichAttachmentCollector
 from app.core.streaming import GuestRenderer, StreamRenderer
 from app.core.tools import ToolDispatcher, tools_without_memory
 from app.db.models import User
@@ -19,6 +20,26 @@ from app.services import Services
 from app.utils.tokens import estimate_tokens
 
 log = get_logger("handlers.pipeline")
+
+
+def _reference_system_note(references: ReferenceAssets) -> str:
+    """Tell the model which media refs belong to the current turn."""
+    lines = ["[本轮参考素材边界]"]
+    if references.images:
+        lines.append(
+            f"- 本轮包含 {len(references.images)} 张图片参考,可用于图生图/图生视频。"
+        )
+    else:
+        lines.append(
+            "- 本轮没有图片参考;如果用户请求视频,应按文生视频处理,不要从历史消息借图。"
+        )
+    if references.audio is not None:
+        lines.append("- 本轮包含音频/语音参考,可用于音色复刻。")
+    else:
+        lines.append(
+            "- 本轮没有音频/语音参考;历史消息、助理生成语音、工具结果都不能当作用户本轮发送的音频。"
+        )
+    return "\n\n" + "\n".join(lines)
 
 
 def build_dispatcher(
@@ -69,9 +90,16 @@ def build_dispatcher(
             return "图片生成失败:未返回图片"
         total = len(urls)
         sent = 0
+        attached: list[str] = []
         mode_tag = "图生图" if subject_ref else "文生图"
         for i, u in enumerate(urls):
-            if delivery.is_guest:
+            rich_att = await delivery.attach_rich_media(
+                "image", u, label=f"生成图片 {i + 1}",
+            )
+            if rich_att is not None:
+                attached.append(rich_att.markdown)
+                sent += 1
+            elif delivery.is_guest:
                 # Guest 单 inline 消息:仅首张作为媒体,其余不展示(在 note 注明)
                 if i == 0:
                     note = (f"\n\n⚠️ 共生成 {total} 张,Guest 模式仅展示首张。"
@@ -87,6 +115,13 @@ def build_dispatcher(
                     sent += 1
         await svc.quota.settle(user, "calls", svc.quota.call_weight("image"),
                                chat_id=chat_id, kind="image")
+        if attached:
+            return (
+                f"已生成 {sent} 张图片({mode_tag})。"
+                "请在最终回复中把下面 Rich Markdown 媒体块放在语义合适的位置;"
+                "不要只把链接堆在开头或结尾。若需要说明图片,先写说明再插入对应媒体块。\n"
+                + "\n\n".join(attached)
+            )
         return f"已生成并发送 {sent} 张图片({mode_tag})。"
 
     async def generate_video(args: dict[str, Any]) -> str:
@@ -146,15 +181,27 @@ def build_dispatcher(
             voice_id=args.get("voice_id", "male-qn-qingse"),
             emotion=args.get("emotion"),
             language_boost=args.get("language_boost"),
+            audio_format="mp3",
         )
         if not audio_url and not audio_bytes:
             return "语音合成失败:无音频返回"
-        ok = await delivery.send_voice(audio_url, audio_bytes)
-        if not ok:
+        rich_att = None
+        if audio_url:
+            rich_att = await delivery.attach_rich_media(
+                "audio", audio_url, label="生成语音")
+        ok = await delivery.send_voice(audio_url, audio_bytes, filename="speech.mp3")
+        if not ok and rich_att is None:
             return "语音已合成,但当前场景(Guest 模式)无法投递,请到私聊使用。"
         await svc.quota.settle(user, "calls", svc.quota.call_weight("tts"),
                                chat_id=chat_id, kind="tts")
-        return f"语音已发送(时长 {dur_ms / 1000:.1f} 秒)。"
+        if rich_att is not None:
+            return (
+                f"语音已生成并投递(时长 {dur_ms / 1000:.1f} 秒)。"
+                "请在最终回复中把下面 Rich Markdown 音频块放在语义合适的位置;"
+                "必须保持 Rich Message 富文本。\n"
+                + rich_att.markdown
+            )
+        return f"语音气泡已发送(时长 {dur_ms / 1000:.1f} 秒)。"
 
     async def generate_music(args: dict[str, Any]) -> str:
         check = await svc.quota.precheck(user, "calls", svc.quota.call_weight("music"))
@@ -426,9 +473,14 @@ async def run_chat_pipeline(
             chat_id, message.chat.type, message.chat.title or message.chat.full_name,
             svc.settings.default_token_budget,
         )
+        # 提取参考素材(当前消息 + 被回复消息),并把“本轮边界”显式写进 system prompt。
+        # 这能防止模型把历史中的 Bot 生成语音/图片误认为用户本轮上传。
+        from app.handlers.media import extract_references
+        references = await extract_references(svc, message)
         messages = await svc.context.build(
             chat_id, user.tg_id, content,
             scope=scope, scope_owner=scope_owner, query_text=query_text,
+            extra_system=_reference_system_note(references),
             enable_memory=enable_memory,
         )
 
@@ -438,14 +490,15 @@ async def run_chat_pipeline(
         except Exception:
             pass
 
+        rich_attachments = RichAttachmentCollector()
+        setattr(renderer, "rich_attachments", rich_attachments)
+
         # renderer.start() 已就位:Guest 的 inline_message_id 此时可取 → 决定投递方式
         if isinstance(renderer, GuestRenderer):
             delivery: MediaDelivery = GuestDelivery(renderer)
         else:
-            delivery = DirectDelivery(svc.bot, chat_id, svc.limiter, svc.files_api)
-        # 提取参考素材(当前消息 + 被回复消息中的图片/音频)
-        from app.handlers.media import extract_references
-        references = await extract_references(svc, message)
+            delivery = DirectDelivery(
+                svc.bot, chat_id, svc.limiter, svc.files_api, rich_attachments)
         dispatcher = build_dispatcher(svc, user, chat_id, scope, scope_owner,
                                       delivery, references=references,
                                       enable_memory=enable_memory)

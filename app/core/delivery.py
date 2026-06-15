@@ -14,6 +14,7 @@ DirectDelivery(私聊/群聊)= 现行直发行为,不变。
 from __future__ import annotations
 
 from typing import Any, Protocol
+from urllib.parse import unquote, urlparse
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
@@ -21,7 +22,9 @@ from aiogram.types import BufferedInputFile, URLInputFile
 
 from app.core.concurrency import SendRateLimiter
 from app.core.htmlfmt import sanitize_telegram_html
+from app.core.richmsg import RichAttachment, RichAttachmentCollector
 from app.logging import get_logger
+from app.utils.audio import to_ogg_opus
 
 log = get_logger("core.delivery")
 
@@ -31,14 +34,37 @@ async def _sleep_retry_after(e: TelegramRetryAfter) -> None:
     await asyncio.sleep(e.retry_after + 0.5)
 
 
+def _filename_from_url(url: str | None, fallback: str) -> str:
+    if not url:
+        return fallback
+    name = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+    if "." not in name:
+        return fallback
+    return name or fallback
+
+
 class MediaDelivery(Protocol):
     """场景无关的媒体投递接口(供 pipeline 工具调用)。"""
 
     is_guest: bool
     inline_message_id: str | None  # Guest:回填用;Direct:None
 
+    async def attach_rich_media(
+        self,
+        kind: str,
+        url: str,
+        *,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> RichAttachment | None: ...
     async def send_photo(self, url: str, caption: str | None = None) -> bool: ...
-    async def send_voice(self, url: str | None, data: bytes | None = None) -> bool: ...
+    async def send_voice(
+        self,
+        url: str | None,
+        data: bytes | None = None,
+        *,
+        filename: str | None = None,
+    ) -> bool: ...
     async def send_placeholder(self, text: str) -> int | None:
         """直接发一条文本占位。Guest 无需(文本经 renderer 流)。返回 message_id 或 None。"""
         ...
@@ -49,12 +75,19 @@ class MediaDelivery(Protocol):
 class DirectDelivery:
     """私聊/群聊:直接 sendMessage/sendPhoto/sendVoice 到 chat_id(现行行为)。"""
 
-    def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
-                 files_api: Any) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        limiter: SendRateLimiter,
+        files_api: Any,
+        rich_attachments: RichAttachmentCollector | None = None,
+    ) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._limiter = limiter
         self._files_api = files_api
+        self._rich_attachments = rich_attachments
 
     @property
     def is_guest(self) -> bool:
@@ -63,6 +96,18 @@ class DirectDelivery:
     @property
     def inline_message_id(self) -> str | None:
         return None
+
+    async def attach_rich_media(
+        self,
+        kind: str,
+        url: str,
+        *,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> RichAttachment | None:
+        if self._rich_attachments is None:
+            return None
+        return self._rich_attachments.add(kind, url, label=label, note=note)
 
     async def send_photo(self, url: str, caption: str | None = None) -> bool:
         try:
@@ -77,19 +122,40 @@ class DirectDelivery:
             log.warning("图片直发失败", 会话=self._chat_id, 错误=str(e)[:120])
             return False
 
-    async def send_voice(self, url: str | None, data: bytes | None = None) -> bool:
+    async def send_voice(
+        self,
+        url: str | None,
+        data: bytes | None = None,
+        *,
+        filename: str | None = None,
+    ) -> bool:
+        audio_filename = filename or _filename_from_url(url, "speech.mp3")
         try:
             if data is None and url:
                 data = await self._files_api.download(url)
             if data is None:
                 return False
+            voice_data = await to_ogg_opus(data)
             await self._limiter.acquire()
             await self._bot.send_voice(
-                self._chat_id, BufferedInputFile(data, filename="speech.mp3"))
+                self._chat_id, BufferedInputFile(voice_data, filename="speech.ogg"))
             return True
         except Exception as e:
-            log.warning("语音直发失败", 会话=self._chat_id, 错误=str(e)[:120])
-            return False
+            log.warning("语音气泡发送失败,尝试音频文件兜底", 会话=self._chat_id,
+                        错误=str(e)[:120])
+            try:
+                if data is None and url:
+                    data = await self._files_api.download(url)
+                if data is None:
+                    return False
+                await self._limiter.acquire()
+                await self._bot.send_audio(
+                    self._chat_id, BufferedInputFile(data, filename=audio_filename))
+                return True
+            except Exception as e2:
+                log.warning("语音音频文件兜底失败", 会话=self._chat_id,
+                            错误=str(e2)[:120])
+                return False
 
     async def send_placeholder(self, text: str) -> int | None:
         while True:
@@ -139,18 +205,37 @@ class GuestDelivery:
     def inline_message_id(self) -> str | None:
         return getattr(self._renderer, "_inline_message_id", None)
 
+    async def attach_rich_media(
+        self,
+        kind: str,
+        url: str,
+        *,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> RichAttachment | None:
+        attach = getattr(self._renderer, "attach_rich_media", None)
+        if attach is None:
+            return None
+        return attach(kind, url, label=label, note=note)
+
     async def send_photo(self, url: str, caption: str | None = None) -> bool:
         self._renderer.attach_pending("photo", url, caption)
         return True
 
-    async def send_voice(self, url: str | None, data: bytes | None = None) -> bool:
+    async def send_voice(
+        self,
+        url: str | None,
+        data: bytes | None = None,
+        *,
+        filename: str | None = None,
+    ) -> bool:
         # inline editMessageMedia 无 Voice 类型,按 Audio 投递(音频播放器,等价体验)。
         # inline 媒体仅支持 URL/file_id,无法上传新字节 → data-only 时无法投递。
         if not url:
             log.warning("Guest语音投递需要URL,字节模式不支持")
             return False
-        self._renderer.attach_pending("audio", url, None)
-        return True
+        attached = await self.attach_rich_media("audio", url, label="生成语音")
+        return attached is not None
 
     async def send_placeholder(self, text: str) -> int | None:
         return None  # Guest:文本状态经 renderer 流,不发独立占位

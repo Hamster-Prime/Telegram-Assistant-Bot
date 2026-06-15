@@ -10,6 +10,7 @@ from aiogram.methods import EditMessageText
 
 from app.core.concurrency import SendRateLimiter
 from app.core.ratelimit import EditThrottle
+from app.core.richmsg import RichAttachmentCollector
 from app.core.streaming import (
     TG_MESSAGE_LIMIT,
     DraftRenderer,
@@ -275,7 +276,7 @@ async def test_guest_renderer_finalizes_as_photo_when_pending(limiter):
     assert "备注" in media.caption
 
 
-async def test_guest_renderer_finalizes_as_audio_for_voice(limiter):
+async def test_guest_renderer_finalizes_audio_as_rich_message(limiter):
     bot = GuestFakeBot()
     r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
                       limiter=limiter, throttle_ms=1)
@@ -283,10 +284,32 @@ async def test_guest_renderer_finalizes_as_audio_for_voice(limiter):
     r.attach_pending("audio", "https://cdn.test/speech.mp3", note=None)
     await r.finalize("已朗读")
 
-    assert len(bot.media_edits) == 1
-    from aiogram.types import InputMediaAudio
-    assert isinstance(bot.media_edits[0].media, InputMediaAudio)
-    assert bot.media_edits[0].media.media == "https://cdn.test/speech.mp3"
+    assert bot.media_edits == []
+    assert bot.text_edits
+    assert "![生成语音](https://cdn.test/speech.mp3)" in bot.text_edits[-1][0]
+
+
+async def test_guest_audio_keeps_rich_markdown(limiter):
+    bot = GuestFakeBot()
+    r = GuestRenderer(bot, chat_id=9, guest_query_id="gq-x",
+                      limiter=limiter, throttle_ms=1)
+    await r.start()
+    r.attach_pending("audio", "https://cdn.test/speech.mp3", note=None)
+    await r.finalize(
+        "**语音已生成**\n\n"
+        "这里是说明文字。\n\n"
+        "[生成语音](https://cdn.test/speech.mp3)"
+    )
+
+    assert bot.media_edits == []
+    assert bot.text_edits
+    rendered = bot.text_edits[-1][0]
+    assert "语音已生成" in rendered
+    assert "这里是说明文字" in rendered
+    assert "**" in rendered
+    assert "[生成语音](https://cdn.test/speech.mp3)" in rendered
+    assert "![生成语音](https://cdn.test/speech.mp3)" in rendered
+    assert "https://cdn.test/speech.mp3" in rendered
 
 
 async def test_guest_renderer_only_first_media_attached(limiter):
@@ -688,3 +711,53 @@ async def test_set_status_after_content_renders_body_plus_status(limiter):
     # _committed 不应被 set_status 改动
     assert r._committed == "第一轮正文"
     await r.finalize("第一轮正文完成")
+
+
+# ── Rich Message 生成附件合并 ────────────────────────────────
+
+async def test_draft_finalize_merges_rich_attachments(limiter):
+    bot = FakeBot()
+    collector = RichAttachmentCollector()
+    collector.add("image", "https://cdn.test/a.jpg", label="生成图片 1")
+    r = DraftRenderer(
+        bot, chat_id=42, limiter=limiter, typing_refresh_s=10,
+        rich_attachments=collector,
+    )
+
+    await r.start()
+    await r.finalize("结果如下:")
+
+    assert "结果如下:" in bot.sent[-1][1]
+    assert "![生成图片 1](https://cdn.test/a.jpg)" in bot.sent[-1][1]
+
+
+async def test_edit_finalize_merges_rich_attachments(limiter):
+    bot = FakeBot()
+    collector = RichAttachmentCollector()
+    collector.add("image", "https://cdn.test/a.jpg", label="生成图片 1")
+    r = EditRenderer(
+        bot, chat_id=42, limiter=limiter, throttle_ms=1,
+        typing_refresh_s=10, rich_attachments=collector,
+    )
+
+    await r.start()
+    await r.finalize("结果如下:")
+
+    assert "结果如下:" in bot.edits[-1][2]
+    assert "![生成图片 1](https://cdn.test/a.jpg)" in bot.edits[-1][2]
+
+
+async def test_guest_finalize_merges_rich_attachments(limiter):
+    bot = GuestFakeBot()
+    collector = RichAttachmentCollector()
+    collector.add("image", "https://cdn.test/a.jpg", label="生成图片 1")
+    r = GuestRenderer(
+        bot, chat_id=9, guest_query_id="gq-x", limiter=limiter,
+        throttle_ms=1, rich_attachments=collector,
+    )
+
+    await r.start()
+    await r.finalize("结果如下:")
+
+    assert "结果如下:" in bot.text_edits[-1][0]
+    assert "![生成图片 1](https://cdn.test/a.jpg)" in bot.text_edits[-1][0]

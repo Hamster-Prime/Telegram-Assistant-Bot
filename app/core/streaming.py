@@ -51,7 +51,14 @@ from aiogram.types import (
 
 from app.core.concurrency import SendRateLimiter
 from app.core.ratelimit import EditThrottle
-from app.core.richmsg import RICH_MESSAGE_LIMIT, clip_markdown, to_rich_input
+from app.core.richmsg import (
+    RICH_MESSAGE_LIMIT,
+    RichAttachment,
+    RichAttachmentCollector,
+    clip_markdown,
+    merge_attachments,
+    to_rich_input,
+)
 from app.logging import get_logger
 
 log = get_logger("core.streaming")
@@ -207,9 +214,16 @@ class DraftRenderer:
     一旦首个 draft 预览成功发出(draft 自带流式预览),停止 typing 任务。
     """
 
-    def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
-                 throttle_ms: int = 1000, *,
-                 typing_refresh_s: float = 4.0) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        limiter: SendRateLimiter,
+        throttle_ms: int = 1000,
+        *,
+        typing_refresh_s: float = 4.0,
+        rich_attachments: RichAttachmentCollector | None = None,
+    ) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._limiter = limiter
@@ -221,6 +235,7 @@ class DraftRenderer:
         self._typing_task: asyncio.Task | None = None
         self._first_token_sent = False
         self._last_rendered = ""
+        self.rich_attachments = rich_attachments
 
     async def _send_draft(self, text: str) -> None:
         await self._bot(SendRichMessageDraft(
@@ -273,7 +288,9 @@ class DraftRenderer:
 
     async def finalize(self, full_text: str) -> int | None:
         await self._stop_typing()
-        text = clip(full_text) or "(空回复)"
+        expected_text = full_text.strip() or "(空回复)"
+        text = merge_attachments(full_text, self.rich_attachments) or "(空回复)"
+        text = clip(text)
         # 防弹化定稿:Rich 失败降级纯文本,限流退避,最终失败不抛出(避免冒泡 errors.py)
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -283,7 +300,7 @@ class DraftRenderer:
                     chat_id=self._chat_id,
                     rich_message=to_rich_input(text),
                 ))
-                self._last_rendered = full_text
+                self._last_rendered = expected_text
                 log.info("私聊回复已定稿", 会话=self._chat_id, 消息ID=msg.message_id,
                          长度=len(text))
                 return msg.message_id
@@ -298,7 +315,7 @@ class DraftRenderer:
                     await self._limiter.acquire()
                     m = await self._bot.send_message(
                         self._chat_id, clip_markdown(text), parse_mode=None)
-                    self._last_rendered = full_text
+                    self._last_rendered = expected_text
                     return m.message_id
                 except TelegramRetryAfter as re_:
                     last_exc = re_
@@ -478,11 +495,18 @@ class EditRenderer(_TickLoopMixin):
     finalize/fail。状态行渲染由轮询循环在占位/内容写入期驱动(idle 不发编辑)。
     """
 
-    def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
-                 throttle_ms: int = 3000,
-                 reply_to_message_id: int | None = None,
-                  placeholder: str = "*" + _STATUS_THINKING + "*", *,
-                 typing_refresh_s: float = 4.0) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        limiter: SendRateLimiter,
+        throttle_ms: int = 3000,
+        reply_to_message_id: int | None = None,
+        placeholder: str = "*" + _STATUS_THINKING + "*",
+        *,
+        typing_refresh_s: float = 4.0,
+        rich_attachments: RichAttachmentCollector | None = None,
+    ) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._limiter = limiter
@@ -493,6 +517,7 @@ class EditRenderer(_TickLoopMixin):
         self._typing_stop: asyncio.Event | None = None
         self._typing_task: asyncio.Task | None = None
         self._last_rendered = ""
+        self.rich_attachments = rich_attachments
         self._tick_init(throttle_ms / 1000)
 
     def _on_committed(self, text: str) -> None:
@@ -583,7 +608,8 @@ class EditRenderer(_TickLoopMixin):
     async def finalize(self, full_text: str) -> int | None:
         await self._stop_tick()
         await self._stop_typing()
-        text = full_text.strip() or "(空回复)"
+        expected_text = full_text.strip() or "(空回复)"
+        text = merge_attachments(full_text, self.rich_attachments).strip() or "(空回复)"
         if self._message_id is None:
             await self.start()
             await self._stop_tick()
@@ -593,7 +619,7 @@ class EditRenderer(_TickLoopMixin):
             await self._do_edit(rendered, plain=plain)
         ok = await _commit_final_edit(_edit_fn, text, chat_label=self._chat_id)
         if ok:
-            self._last_rendered = text
+            self._last_rendered = expected_text
         log.info("编辑流回复已定稿", 会话=self._chat_id, 消息ID=self._message_id,
                  长度=len(text), 落地="成功" if ok else "失败")
         return self._message_id
@@ -639,8 +665,16 @@ class GuestRenderer(_TickLoopMixin):
     「工作中」信号 —— 由统一轮询循环在占位/内容写入期渲染(idle 不发编辑)。
     """
 
-    def __init__(self, bot: Bot, chat_id: int, guest_query_id: str,
-                 limiter: SendRateLimiter, throttle_ms: int = 1000) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        guest_query_id: str,
+        limiter: SendRateLimiter,
+        throttle_ms: int = 1000,
+        *,
+        rich_attachments: RichAttachmentCollector | None = None,
+    ) -> None:
         self._bot = bot
         self._chat_id = chat_id
         self._guest_query_id = guest_query_id
@@ -648,6 +682,7 @@ class GuestRenderer(_TickLoopMixin):
         self._inline_message_id: str | None = None
         self._pending_media: dict[str, Any] | None = None
         self._last_rendered = ""
+        self.rich_attachments = rich_attachments
         self._tick_init(throttle_ms / 1000)
 
     def _on_committed(self, text: str) -> None:
@@ -657,6 +692,18 @@ class GuestRenderer(_TickLoopMixin):
         """暂存一个待投递媒体(图片=photo / 语音=audio)。仅保留首个。"""
         if self._pending_media is None:
             self._pending_media = {"kind": kind, "url": url, "note": note or ""}
+
+    def attach_rich_media(
+        self,
+        kind: str,
+        url: str,
+        *,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> RichAttachment | None:
+        if self.rich_attachments is None:
+            self.rich_attachments = RichAttachmentCollector()
+        return self.rich_attachments.add(kind, url, label=label, note=note)
 
     async def start(self) -> None:
         try:
@@ -739,10 +786,14 @@ class GuestRenderer(_TickLoopMixin):
 
     async def finalize(self, full_text: str) -> int | None:
         await self._stop_tick()
-        text = (full_text.strip() or "(空回复)")
+        expected_text = full_text.strip() or "(空回复)"
+        text = merge_attachments(full_text, self.rich_attachments).strip() or "(空回复)"
         pm = self._pending_media
+        if pm and pm.get("kind") == "audio":
+            self.attach_rich_media("audio", pm["url"], label="生成语音")
+            text = merge_attachments(full_text, self.rich_attachments).strip() or text
         ok_final = False
-        if pm and self._inline_message_id is not None:
+        if pm and pm.get("kind") != "audio" and self._inline_message_id is not None:
             caption = clip_markdown(text)
             note = pm.get("note") or ""
             if note:
@@ -762,7 +813,7 @@ class GuestRenderer(_TickLoopMixin):
             ok_final = await _commit_final_edit(_edit_fn, text,
                                                 chat_label=self._chat_id)
         if ok_final:
-            self._last_rendered = text
+            self._last_rendered = expected_text
         log.info("Guest回复已定稿", 会话=self._chat_id,
                  内联消息ID=self._inline_message_id or "无",
                  形式=pm["kind"] if pm else "文本", 长度=len(full_text),

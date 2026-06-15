@@ -333,3 +333,33 @@ async def test_agent_drives_real_renderer_status_sequence(limiter):
     # 3) Agent 结果正确
     assert result.text == "根据搜索结果,答案是 42。"
     assert result.tools_used == ["web_search"]
+
+
+async def test_agent_does_not_refinalize_when_renderer_appends_rich_attachment(limiter):
+    """Renderer 自动追加附件时,Agent 终稿对账仍应以模型正文为准。"""
+    import tests.test_streaming as _ts
+
+    from app.core.richmsg import RichAttachmentCollector
+
+    bot = _ts.FakeBot()
+    collector = RichAttachmentCollector()
+    collector.add("image", "https://cdn.test/a.jpg", label="生成图片 1")
+    r = _ts.EditRenderer(
+        bot, chat_id=42, limiter=limiter, throttle_ms=1,
+        typing_refresh_s=10, rich_attachments=collector,
+    )
+    await r.start()
+
+    chat = ScriptedChat([[
+        ChatStreamEvent(kind="content", text="结果如下:"),
+        ChatStreamEvent(kind="finish", finish_reason="stop"),
+    ]])
+    agent = Agent(chat)
+    result = await agent.run([{"role": "user", "content": "生成图片"}], r,
+                             ToolDispatcher())
+
+    final_edits = [e for e in bot.edits if "结果如下:" in e[2]]
+    assert len(final_edits) == 1
+    assert "![生成图片 1](https://cdn.test/a.jpg)" in final_edits[0][2]
+    assert r.last_rendered_text == "结果如下:"
+    assert result.text == "结果如下:"
