@@ -15,15 +15,14 @@ from app.core.streaming import (
     DraftRenderer,
     EditRenderer,
     GuestRenderer,
-    _render_for_telegram,
     clip,
 )
 
 
 def test_clip():
     assert clip("短文本") == "短文本"
-    long = "x" * 5000
-    assert len(clip(long)) == 4096
+    long = "x" * 40000
+    assert len(clip(long)) == TG_MESSAGE_LIMIT
     assert clip(long).endswith("…")
 
 
@@ -61,7 +60,7 @@ class FakeMessage:
 
 
 class FakeBot:
-    """记录调用的假 Bot(支持 chat_action + 错误注入)。"""
+    """记录调用的假 Bot(支持 chat_action + 错误注入 + Rich Message)。"""
 
     def __init__(self):
         self.sent: list[tuple] = []
@@ -79,7 +78,21 @@ class FakeBot:
         self._send_error_fired = False
 
     async def __call__(self, method):
+        from aiogram.methods import SendRichMessage, SendRichMessageDraft
         self.methods.append(method)
+        if isinstance(method, SendRichMessage):
+            if self.send_error is not None and (
+                self.send_error_always or not self._send_error_fired
+            ):
+                self._send_error_fired = True
+                raise self.send_error
+            self._next_id += 1
+            self.sent.append((method.chat_id, method.rich_message.markdown))
+            self.sent_kwargs.append({"rich_message": method.rich_message})
+            return FakeMessage(self._next_id)
+        if isinstance(method, SendRichMessageDraft):
+            return True
+        return None
 
     async def send_message(self, chat_id, text, **kwargs):
         if self.send_error is not None and (
@@ -92,14 +105,23 @@ class FakeBot:
         self.sent_kwargs.append(kwargs)
         return FakeMessage(self._next_id)
 
-    async def edit_message_text(self, text, chat_id=None, message_id=None, **kwargs):
+    async def edit_message_text(self, text=None, *, rich_message=None,
+                                 chat_id=None, message_id=None,
+                                 parse_mode=None, inline_message_id=None, **kwargs):
         if self.edit_error is not None and (
             self.edit_error_always or not self._edit_error_fired
         ):
             self._edit_error_fired = True
             raise self.edit_error
-        self.edits.append((chat_id, message_id, text))
-        self.edit_kwargs.append(kwargs)
+        recorded = text if text is not None else (
+            rich_message.markdown if rich_message else None
+        )
+        self.edits.append((chat_id, message_id, recorded))
+        self.edit_kwargs.append({
+            "parse_mode": parse_mode,
+            "rich_message": rich_message,
+            "inline_message_id": inline_message_id,
+        })
 
     async def send_chat_action(self, chat_id, action, **kwargs):
         self.chat_actions.append((chat_id, action))
@@ -117,7 +139,7 @@ async def test_edit_renderer_lifecycle(limiter):
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1,
                      typing_refresh_s=10)
     await r.start()
-    assert bot.sent == [(42, "<i>正在处理 ...</i>")]  # 占位(初始即状态行)
+    assert bot.sent == [(42, "*正在处理 ...*")]  # 占位(初始即状态行,Markdown 格式)
 
     await r.update("第一段")
     await asyncio.sleep(0.02)  # 让轮询循环 tick 一次
@@ -128,26 +150,17 @@ async def test_edit_renderer_lifecycle(limiter):
     assert bot.edits[-1] == (42, 101, "第一段完整回复")
 
 
-def test_render_for_telegram_passes_through_valid_html():
-    assert _render_for_telegram("<b>粗体</b> 和 <code>代码</code>") == (
-        "<b>粗体</b> 和 <code>代码</code>"
-    )
-
-
-def test_render_for_telegram_respects_limit_after_html_escaping():
-    assert len(_render_for_telegram("&" * 5000)) <= TG_MESSAGE_LIMIT
-
-
-async def test_edit_renderer_sends_telegram_html(limiter):
+async def test_edit_renderer_sends_rich_message(limiter):
     bot = FakeBot()
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1,
                      typing_refresh_s=10)
     await r.start()
-    await r.finalize("<b>粗体</b>")
+    await r.finalize("**粗体**")
 
-    assert bot.sent_kwargs[0].get("parse_mode") == "HTML"
-    assert bot.edit_kwargs[-1].get("parse_mode") == "HTML"
-    assert bot.edits[-1][2] == "<b>粗体</b>"
+    # SendRichMessage 占位 + editMessageText(rich_message=) 编辑
+    assert bot.sent_kwargs[0].get("rich_message") is not None
+    assert bot.edit_kwargs[-1].get("rich_message") is not None
+    assert bot.edits[-1][2] == "**粗体**"
 
 
 async def test_edit_renderer_fail_path(limiter):
@@ -173,22 +186,22 @@ async def test_draft_renderer_does_not_send_initial_placeholder_in_private(limit
     r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
 
     await r.start()
-    await r.finalize("<b>最终回复</b>")
+    await r.finalize("**最终回复**")
 
-    assert bot.sent == [(42, "<b>最终回复</b>")]
-    assert bot.sent_kwargs[-1].get("parse_mode") == "HTML"
+    assert bot.sent == [(42, "**最终回复**")]
+    assert bot.sent_kwargs[-1].get("rich_message") is not None
 
 
-async def test_draft_finalize_falls_back_to_plain_text_on_html_error(limiter):
-    """私聊定稿:HTML 解析失败时降级纯文本,不丢整条回复。"""
+async def test_draft_finalize_falls_back_to_plain_text_on_rich_error(limiter):
+    """私聊定稿:Rich 解析失败时降级纯文本,不丢整条回复。"""
     bot = FakeBot()
     bot.send_error = TelegramBadRequest(
-        method=EditMessageText, message="Bad Request: can't parse entities")
+        method=EditMessageText, message="Bad Request: can't parse rich message")
     r = DraftRenderer(bot, chat_id=42, limiter=limiter, typing_refresh_s=10)
     await r.start()
-    mid = await r.finalize("好的,<b>我来</b>为您生成")
+    mid = await r.finalize("好的,**我来**为您生成")
 
-    # 第一次 HTML 发送失败 → 降级纯文本(parse_mode=None)成功
+    # 第一次 Rich 发送失败 → 降级纯文本(parse_mode=None)成功
     assert bot.sent, "降级后应有一条成功发送"
     assert bot.sent_kwargs[-1].get("parse_mode") is None
     assert "好的" in bot.sent[-1][1] and "我来" in bot.sent[-1][1]
@@ -227,8 +240,11 @@ class GuestFakeBot:
             return SimpleNamespace(ok=True)
         return None
 
-    async def edit_message_text(self, text, **kwargs):
-        self.text_edits.append((text, kwargs))
+    async def edit_message_text(self, text=None, *, rich_message=None, **kwargs):
+        recorded = text if text is not None else (
+            rich_message.markdown if rich_message else None
+        )
+        self.text_edits.append((recorded, kwargs))
 
 
 async def test_guest_renderer_text_finalize_no_media(limiter):
@@ -351,7 +367,8 @@ async def test_placeholder_shows_status_line(limiter):
     edits_text = [e[2] for e in bot.edits]
     assert any("正在思考 ..." in t for t in edits_text), (
         f"占位阶段应显示状态行,实际编辑 {edits_text}")
-    assert not any(" " in t for t in edits_text), "不应再有 nbsp 占位闪烁"
+    # 状态行不应包含 nbsp(\xa0)占位闪烁(旧版光标残留)
+    assert not any("\xa0" in t for t in edits_text), "不应有 nbsp 占位闪烁"
 
 
 async def test_content_edit_has_status_line_suffix(limiter):
@@ -420,17 +437,17 @@ async def test_finalize_enforces_interval_after_recent_edit(limiter):
 
 # ── 定稿防弹化(修复「语句截断」)─────────────────────────────
 
-async def test_finalize_falls_back_to_plain_text_on_html_error(limiter):
-    """HTML 解析失败时,finalize 降级为纯文本编辑,保证完整文本落地。"""
+async def test_finalize_falls_back_to_plain_text_on_rich_error(limiter):
+    """Rich 解析失败时,finalize 降级为纯文本编辑,保证完整文本落地。"""
     bot = FakeBot()
     bot.edit_error = TelegramBadRequest(
-        method=EditMessageText, message="Bad Request: can't parse entities")
+        method=EditMessageText, message="Bad Request: can't parse rich message")
     r = EditRenderer(bot, chat_id=42, limiter=limiter, throttle_ms=1,
                      typing_refresh_s=10)
     await r.start()
     await r.finalize("好的,我来为您生成")
 
-    # 纯文本降级:parse_mode=None,文本为完整原文(转义后)
+    # 纯文本降级:parse_mode=None,文本为完整原文
     assert bot.edit_kwargs[-1].get("parse_mode") is None
     assert "好的,我来为您生成" in bot.edits[-1][2]
     assert r.last_rendered_text == "好的,我来为您生成"

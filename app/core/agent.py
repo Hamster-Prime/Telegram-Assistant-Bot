@@ -82,8 +82,8 @@ class Agent:
                         display = _strip_meta_prefix(full_text)
                         if show_thinking and reasoning_text:
                             display = (
-                                f"<blockquote expandable>\n{reasoning_text}"
-                                f"\n</blockquote>\n\n{display}"
+                                f"<details open><summary>💭 思考过程</summary>\n\n"
+                                f"{reasoning_text}\n\n</details>\n\n{display}"
                             )
                         await renderer.update(display)
                     elif ev.kind == "reasoning":
@@ -151,8 +151,8 @@ class Agent:
             display = _strip_meta_prefix(full_text)
             if show_thinking and result.reasoning:
                 display = (
-                    f"<blockquote expandable>\n{result.reasoning}"
-                    f"\n</blockquote>\n\n{display}"
+                    f"<details open><summary>💭 思考过程</summary>\n\n"
+                    f"{result.reasoning}\n\n</details>\n\n{display}"
                 )
             await renderer.finalize(display or "(空回复)")
             # 终稿对账:末次编辑可能因限流/HTML错误未落地,消息停在较短中间状态。

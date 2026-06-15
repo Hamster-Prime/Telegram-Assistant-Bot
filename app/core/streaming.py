@@ -5,7 +5,7 @@
 - Guest:answerGuestQuery 一次应答入口 → 返回 inline_message_id 上轮询编辑
 并发隔离:每个回答独立 draft_id / 占位消息,互不覆盖。
 
-aiogram 3.28 已原生封装 SendMessageDraft / AnswerGuestQuery(Bot API 10.x)。
+aiogram 3.29 原生封装 SendRichMessage / SendRichMessageDraft / AnswerGuestQuery(Bot API 10.1)。
 
 限流约束(Telegram 官方 FAQ,多用户安全):
 - 单聊 sendMessage/editMessageText ≤1 条/秒(短突发可,持续超则 429)
@@ -28,7 +28,6 @@ finalize 紧随末次编辑时由 _ensure_interval_elapsed 补齐 sleep,杜绝 4
 from __future__ import annotations
 
 import asyncio
-import html
 import secrets
 import time
 from typing import Any, Protocol
@@ -36,24 +35,28 @@ from typing import Any, Protocol
 from aiogram import Bot
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import AnswerGuestQuery, EditMessageMedia, SendMessageDraft
+from aiogram.methods import (
+    AnswerGuestQuery,
+    EditMessageMedia,
+    SendRichMessage,
+    SendRichMessageDraft,
+)
 from aiogram.types import (
     InlineQueryResultArticle,
     InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
-    InputTextMessageContent,
+    InputRichMessageContent,
 )
 
 from app.core.concurrency import SendRateLimiter
-from app.core.htmlfmt import sanitize_telegram_html
 from app.core.ratelimit import EditThrottle
+from app.core.richmsg import RICH_MESSAGE_LIMIT, clip_markdown, to_rich_input
 from app.logging import get_logger
 
 log = get_logger("core.streaming")
 
-TG_MESSAGE_LIMIT = 4096  # Telegram 单消息长度上限
-TG_PARSE_MODE = "HTML"
+TG_MESSAGE_LIMIT = RICH_MESSAGE_LIMIT  # Rich Message 上限(32KB)
 
 # 状态行文案:按语义分类映射工具名(供 set_status 驱动)
 _SEARCH_TOOLS = frozenset({"web_search", "web_fetch"})
@@ -77,16 +80,6 @@ def clip(text: str, limit: int = TG_MESSAGE_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
-
-
-def _render_for_telegram(text: str) -> str:
-    raw = clip(text)
-    rendered = sanitize_telegram_html(raw)
-    if len(rendered) <= TG_MESSAGE_LIMIT:
-        return rendered
-    while raw and len(html.escape(raw)) > TG_MESSAGE_LIMIT:
-        raw = raw[:-1]
-    return html.escape(raw)
 
 
 async def _sleep_retry_after(e: TelegramRetryAfter) -> None:
@@ -163,19 +156,19 @@ async def _commit_final_edit(
     """防弹化的末次编辑 —— 保证完整文本落地,杜绝「语句截断」。
 
     流程:
-    1. HTML 渲染编辑(传原始文本,由 edit_callable 负责渲染)
+    1. Rich Markdown 编辑(edit_callable 内部用 editMessageText(rich_message=…))
     2. 「message is not modified」→ 文本未变,视为成功
-    3. 其它 TelegramBadRequest(如 "can't parse entities")→ 降级纯文本编辑
+    3. Rich 解析失败 → 降级纯文本编辑(edit_callable(text, plain=True))
     4. TelegramRetryAfter → 退避重试(上限 3 次)
-    5. 仍失败 → 记 error 但不再抛出(避免冒泡到 errors.py 用「内部错误」覆盖消息)
+    5. 仍失败 → 记 error 但不再抛出(避免冒泡到 errors.py)
 
-    edit_callable(text, parse_mode=...) 由调用方提供,封装 chat/inline 差异。
+    edit_callable(text, *, plain=False) 由调用方提供,封装 chat/inline 差异。
     返回 True 表示完整文本已成功落地。
     """
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            await edit_callable(text, parse_mode=TG_PARSE_MODE)
+            await edit_callable(text)
             return True
         except TelegramRetryAfter as e:
             last_exc = e
@@ -187,22 +180,19 @@ async def _commit_final_edit(
             msg = str(e)
             if "message is not modified" in msg:
                 return True
-            if "entities" in msg or "parse" in msg or "tag" in msg:
-                log.warning("定稿HTML解析失败,降级纯文本", 标识=chat_label, 错误=msg[:120])
-                try:
-                    await edit_callable(html.escape(text), parse_mode=None)
+            log.warning("定稿Rich解析失败,降级纯文本", 标识=chat_label, 错误=msg[:120])
+            try:
+                await edit_callable(text, plain=True)
+                return True
+            except TelegramRetryAfter as re_:
+                last_exc = re_
+                await asyncio.sleep(re_.retry_after + 0.3)
+                continue
+            except TelegramBadRequest as e2:
+                if "message is not modified" in str(e2):
                     return True
-                except TelegramRetryAfter as re_:
-                    last_exc = re_
-                    await asyncio.sleep(re_.retry_after + 0.3)
-                    continue
-                except TelegramBadRequest as e2:
-                    if "message is not modified" in str(e2):
-                        return True
-                    last_exc = e2
-                    continue
-            last_exc = e
-            continue
+                last_exc = e2
+                continue
     log.error("定稿编辑最终失败(消息可能停留在较短的中间状态)", 标识=chat_label,
               错误=str(last_exc)[:160] if last_exc else "未知")
     return False
@@ -233,11 +223,10 @@ class DraftRenderer:
         self._last_rendered = ""
 
     async def _send_draft(self, text: str) -> None:
-        await self._bot(SendMessageDraft(
+        await self._bot(SendRichMessageDraft(
             chat_id=self._chat_id,
             draft_id=self._draft_id,
-            text=_render_for_telegram(text) or "…",
-            parse_mode=TG_PARSE_MODE,
+            rich_message=to_rich_input(text or "…"),
         ))
 
     async def start(self) -> None:
@@ -285,15 +274,15 @@ class DraftRenderer:
     async def finalize(self, full_text: str) -> int | None:
         await self._stop_typing()
         text = clip(full_text) or "(空回复)"
-        # 防弹化定稿:HTML 失败降级纯文本,限流退避,最终失败不抛出(避免冒泡 errors.py)
+        # 防弹化定稿:Rich 失败降级纯文本,限流退避,最终失败不抛出(避免冒泡 errors.py)
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
                 await self._limiter.acquire()
-                msg = await self._bot.send_message(
-                    self._chat_id, _render_for_telegram(text),
-                    parse_mode=TG_PARSE_MODE,
-                )
+                msg = await self._bot(SendRichMessage(
+                    chat_id=self._chat_id,
+                    rich_message=to_rich_input(text),
+                ))
                 self._last_rendered = full_text
                 log.info("私聊回复已定稿", 会话=self._chat_id, 消息ID=msg.message_id,
                          长度=len(text))
@@ -303,24 +292,21 @@ class DraftRenderer:
                 await _sleep_retry_after(e)
             except TelegramBadRequest as e:
                 msg_str = str(e)
-                if "entities" in msg_str or "parse" in msg_str or "tag" in msg_str:
-                    log.warning("私聊定稿HTML解析失败,降级纯文本", 会话=self._chat_id,
-                                错误=msg_str[:120])
-                    try:
-                        await self._limiter.acquire()
-                        m = await self._bot.send_message(
-                            self._chat_id, html.escape(text), parse_mode=None)
-                        self._last_rendered = full_text
-                        return m.message_id
-                    except TelegramRetryAfter as re_:
-                        last_exc = re_
-                        await _sleep_retry_after(re_)
-                        continue
-                    except Exception as e2:
-                        last_exc = e2
-                        continue
-                last_exc = e
-                continue
+                log.warning("私聊定稿Rich解析失败,降级纯文本", 会话=self._chat_id,
+                            错误=msg_str[:120])
+                try:
+                    await self._limiter.acquire()
+                    m = await self._bot.send_message(
+                        self._chat_id, clip_markdown(text), parse_mode=None)
+                    self._last_rendered = full_text
+                    return m.message_id
+                except TelegramRetryAfter as re_:
+                    last_exc = re_
+                    await _sleep_retry_after(re_)
+                    continue
+                except Exception as e2:
+                    last_exc = e2
+                    continue
         log.error("私聊回复定稿最终失败(消息可能未送达)", 会话=self._chat_id,
                   错误=str(last_exc)[:160] if last_exc else "未知")
         return None
@@ -329,12 +315,18 @@ class DraftRenderer:
         await self._stop_typing()
         try:
             await self._limiter.acquire()
-            await self._bot.send_message(
-                self._chat_id, _render_for_telegram(error_text),
-                parse_mode=TG_PARSE_MODE,
-            )
-        except Exception as e:
-            log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
+            await self._bot(SendRichMessage(
+                chat_id=self._chat_id,
+                rich_message=to_rich_input(error_text),
+            ))
+        except Exception:
+            # Rich 失败降级纯文本
+            try:
+                await self._limiter.acquire()
+                await self._bot.send_message(
+                    self._chat_id, clip_markdown(error_text), parse_mode=None)
+            except Exception as e:
+                log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
 
     @property
     def last_rendered_text(self) -> str:
@@ -399,11 +391,11 @@ class _TickLoopMixin:
 
     def _render_body_with_status(self, body: str) -> str:
         """正文 + 空行 + 斜体状态行(内容写入与 set_status 共用)。"""
-        return body + "\n\n<i>" + self._status + "</i>"
+        return body + "\n\n*" + self._status + "*"
 
     def _render_status_placeholder(self) -> str:
         """纯状态行(占位阶段)。"""
-        return "<i>" + self._status + "</i>"
+        return "*" + self._status + "*"
 
     async def _ensure_interval_elapsed(self) -> None:
         """距上次编辑不足 interval 时 sleep 补齐(咽喉点门控,防 429)。
@@ -489,7 +481,7 @@ class EditRenderer(_TickLoopMixin):
     def __init__(self, bot: Bot, chat_id: int, limiter: SendRateLimiter,
                  throttle_ms: int = 3000,
                  reply_to_message_id: int | None = None,
-                 placeholder: str = "<i>" + _STATUS_THINKING + "</i>", *,
+                  placeholder: str = "*" + _STATUS_THINKING + "*", *,
                  typing_refresh_s: float = 4.0) -> None:
         self._bot = bot
         self._chat_id = chat_id
@@ -519,14 +511,16 @@ class EditRenderer(_TickLoopMixin):
         self._typing_stop = None
 
     async def start(self) -> None:
+        from aiogram.types import ReplyParameters
+        reply_params = ReplyParameters(message_id=self._reply_to) if self._reply_to else None
         while True:
             try:
                 await self._limiter.acquire()
-                msg = await self._bot.send_message(
-                    self._chat_id, _render_for_telegram(self._placeholder),
-                    reply_to_message_id=self._reply_to,
-                    parse_mode=TG_PARSE_MODE,
-                )
+                msg = await self._bot(SendRichMessage(
+                    chat_id=self._chat_id,
+                    rich_message=to_rich_input(self._placeholder),
+                    reply_parameters=reply_params,
+                ))
                 self._message_id = msg.message_id
                 log.debug("占位消息已发送", 会话=self._chat_id, 消息ID=msg.message_id)
                 break
@@ -541,37 +535,42 @@ class EditRenderer(_TickLoopMixin):
         self._tick_task = asyncio.create_task(
             self._tick_loop(self._do_edit))
 
-    async def _do_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+    async def _do_edit(self, text: str, *, plain: bool = False) -> None:
         """单次编辑(供轮询循环与定稿共用)。
 
         含咽喉点间隔门控:acquire 后、HTTP 调用前记录时间戳,保证「同一消息
-        任意两次 edit 距离 ≥ interval」。tick 稳态零开销,仅 finalize 紧随
-        末次编辑时补齐,杜绝 429。
+        任意两次 edit 距离 ≥ interval」。plain=True 时降级纯文本(Rich 解析失败)。
         """
         if self._message_id is None:
             return
         await self._ensure_interval_elapsed()
         await self._limiter.acquire()
         self._last_edit_time = time.monotonic()
-        await self._bot.edit_message_text(
-            _render_for_telegram(text) if parse_mode else text,
-            chat_id=self._chat_id,
-            message_id=self._message_id,
-            parse_mode=parse_mode,
-        )
+        if plain:
+            await self._bot.edit_message_text(
+                clip_markdown(text),
+                chat_id=self._chat_id,
+                message_id=self._message_id,
+                parse_mode=None,
+            )
+        else:
+            await self._bot.edit_message_text(
+                rich_message=to_rich_input(text),
+                chat_id=self._chat_id,
+                message_id=self._message_id,
+            )
 
-    async def _raw_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+    async def _raw_edit(self, text: str, *, plain: bool = False) -> None:
         """带 RetryAfter/BadRequest 处理的编辑(轮询循环用)。"""
         while True:
             try:
-                await self._do_edit(text, parse_mode=parse_mode)
+                await self._do_edit(text, plain=plain)
                 return
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
             except TelegramBadRequest as e:
                 if "message is not modified" in str(e):
                     return
-                # 其它 BadRequest(如 HTML 解析失败)→ 静默跳过本次(定稿会兜底)
                 log.debug("轮询编辑BadRequest(忽略)", 错误=str(e)[:100])
                 return
 
@@ -589,9 +588,9 @@ class EditRenderer(_TickLoopMixin):
             await self.start()
             await self._stop_tick()
             await self._stop_typing()
-        # 防弹化末次编辑:HTML 失败降级纯文本,保证完整文本落地(杜绝截断)
-        async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
-            await self._do_edit(rendered, parse_mode=parse_mode)
+        # 防弹化末次编辑:Rich 失败降级纯文本,保证完整文本落地(杜绝截断)
+        async def _edit_fn(rendered: str, *, plain: bool = False) -> None:
+            await self._do_edit(rendered, plain=plain)
         ok = await _commit_final_edit(_edit_fn, text, chat_label=self._chat_id)
         if ok:
             self._last_rendered = text
@@ -604,17 +603,23 @@ class EditRenderer(_TickLoopMixin):
         await self._stop_typing()
         try:
             if self._message_id is not None:
-                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
-                    await self._do_edit(rendered, parse_mode=parse_mode)
+                async def _edit_fn(rendered: str, *, plain: bool = False) -> None:
+                    await self._do_edit(rendered, plain=plain)
                 await _commit_final_edit(_edit_fn, error_text, chat_label=self._chat_id)
             else:
                 await self._limiter.acquire()
+                await self._bot(SendRichMessage(
+                    chat_id=self._chat_id,
+                    rich_message=to_rich_input(error_text),
+                ))
+        except Exception:
+            # Rich 失败降级纯文本
+            try:
+                await self._limiter.acquire()
                 await self._bot.send_message(
-                    self._chat_id, _render_for_telegram(error_text),
-                    parse_mode=TG_PARSE_MODE,
-                )
-        except Exception as e:
-            log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
+                    self._chat_id, clip_markdown(error_text), parse_mode=None)
+            except Exception as e:
+                log.error("发送错误提示失败", 会话=self._chat_id, 错误=str(e)[:120])
 
     @property
     def message_id(self) -> int | None:
@@ -661,9 +666,8 @@ class GuestRenderer(_TickLoopMixin):
                 result=InlineQueryResultArticle(
                     id=self._guest_query_id[:60] or "answer",
                     title="回复",
-                    input_message_content=InputTextMessageContent(
-                        message_text=_render_for_telegram("<i>" + _STATUS_THINKING + "</i>"),
-                        parse_mode=TG_PARSE_MODE,
+                    input_message_content=InputRichMessageContent(
+                        rich_message=to_rich_input("*" + _STATUS_THINKING + "*"),
                     ),
                 ),
             ))
@@ -679,24 +683,30 @@ class GuestRenderer(_TickLoopMixin):
         self._tick_task = asyncio.create_task(
             self._tick_loop(self._raw_edit))
 
-    async def _do_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+    async def _do_edit(self, text: str, *, plain: bool = False) -> None:
         """单次编辑(供轮询循环与定稿共用)。含咽喉点间隔门控,详见基类。"""
         if self._inline_message_id is None:
             return
         await self._ensure_interval_elapsed()
         await self._limiter.acquire()
         self._last_edit_time = time.monotonic()
-        await self._bot.edit_message_text(
-            _render_for_telegram(text) if parse_mode else text,
-            inline_message_id=self._inline_message_id,
-            parse_mode=parse_mode,
-        )
+        if plain:
+            await self._bot.edit_message_text(
+                clip_markdown(text),
+                inline_message_id=self._inline_message_id,
+                parse_mode=None,
+            )
+        else:
+            await self._bot.edit_message_text(
+                rich_message=to_rich_input(text),
+                inline_message_id=self._inline_message_id,
+            )
 
-    async def _raw_edit(self, text: str, *, parse_mode: str = TG_PARSE_MODE) -> None:
+    async def _raw_edit(self, text: str, *, plain: bool = False) -> None:
         """带 RetryAfter/BadRequest 处理的编辑(轮询循环用)。"""
         while True:
             try:
-                await self._do_edit(text, parse_mode=parse_mode)
+                await self._do_edit(text, plain=plain)
                 return
             except TelegramRetryAfter as e:
                 await _sleep_retry_after(e)
@@ -733,25 +743,22 @@ class GuestRenderer(_TickLoopMixin):
         pm = self._pending_media
         ok_final = False
         if pm and self._inline_message_id is not None:
-            caption = _render_for_telegram(text)
+            caption = clip_markdown(text)
             note = pm.get("note") or ""
             if note:
-                # note 来自 GuestDelivery 的原始 caption,需清洗;裁剪后可能切断
-                # 闭合标签,重新 sanitize 以自动补全(幂等于已清洗的 caption 部分)
-                caption = sanitize_telegram_html(
-                    (caption + "\n" + note)[:TG_MESSAGE_LIMIT])
+                caption = clip_markdown(caption + "\n" + note)
             kind, url = pm["kind"], pm["url"]
             media = self._build_media(kind, url, caption)
             ok_final = await self._edit_media(media)
             if not ok_final:
                 link_line = f"\n\n✅ 已生成:[查看]({url})"
-                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
-                    await self._do_edit(rendered, parse_mode=parse_mode)
+                async def _edit_fn(rendered: str, *, plain: bool = False) -> None:
+                    await self._do_edit(rendered, plain=plain)
                 ok_final = await _commit_final_edit(
                     _edit_fn, text + link_line, chat_label=self._chat_id)
         else:
-            async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
-                await self._do_edit(rendered, parse_mode=parse_mode)
+            async def _edit_fn(rendered: str, *, plain: bool = False) -> None:
+                await self._do_edit(rendered, plain=plain)
             ok_final = await _commit_final_edit(_edit_fn, text,
                                                 chat_label=self._chat_id)
         if ok_final:
@@ -764,18 +771,19 @@ class GuestRenderer(_TickLoopMixin):
 
     @staticmethod
     def _build_media(kind: str, url: str, caption: str) -> Any:
+        # 媒体 caption 不支持 Rich Message,用纯文本(parse_mode=None)
         if kind == "photo":
-            return InputMediaPhoto(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
+            return InputMediaPhoto(media=url, caption=caption, parse_mode=None)
         if kind == "video":
-            return InputMediaVideo(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
-        return InputMediaAudio(media=url, caption=caption, parse_mode=TG_PARSE_MODE)
+            return InputMediaVideo(media=url, caption=caption, parse_mode=None)
+        return InputMediaAudio(media=url, caption=caption, parse_mode=None)
 
     async def fail(self, error_text: str) -> None:
         await self._stop_tick()
         try:
             if self._inline_message_id is not None:
-                async def _edit_fn(rendered: str, *, parse_mode: str | None) -> None:
-                    await self._do_edit(rendered, parse_mode=parse_mode)
+                async def _edit_fn(rendered: str, *, plain: bool = False) -> None:
+                    await self._do_edit(rendered, plain=plain)
                 await _commit_final_edit(_edit_fn, error_text,
                                          chat_label=self._chat_id)
         except Exception as e:
